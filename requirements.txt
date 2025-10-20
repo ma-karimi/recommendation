@@ -1,0 +1,9 @@
+polars==1.8.2
+requests>=2.31.0
+python-dotenv>=1.0.1
+# implicit==0.7.2  # optional; install separately after setting up Build Tools (Windows)
+scipy>=1.10.0
+fastapi>=0.115.2
+uvicorn>=0.31.0
+sqlalchemy>=2.0.21
+pymysql>=1.1.0
