@@ -7,7 +7,7 @@ import polars as pl
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from .settings import load_config
+from settings import load_config
 
 
 def _env(key: str, default: str = "") -> str:

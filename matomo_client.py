@@ -5,7 +5,7 @@ from typing import Literal, Sequence
 import polars as pl
 import requests
 
-from .settings import load_config
+from settings import load_config
 
 
 class MatomoClient:

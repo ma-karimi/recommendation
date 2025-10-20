@@ -5,9 +5,9 @@ import os
 
 import polars as pl
 
-from .db_loader import load_products, load_order_items
-from .settings import load_config
-from .matomo_client import load_matomo_client
+from db_loader import load_products, load_order_items
+from settings import load_config
+from matomo_client import load_matomo_client
 
 
 def run_pipeline(start_date: str | None = None, end_date: str | None = None) -> str:
