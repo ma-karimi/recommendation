@@ -14,10 +14,29 @@ def get_engine() -> Engine:
     cfg = load_config()
     url = (cfg.db.url or "").strip()
     if not url:
-        raise RuntimeError("Database URL not configured. Set RECO_DB_URL in .env")
-    
-    engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
-    return engine
+        raise RuntimeError(
+            "Database URL not configured. Set RECO_DB_URL in .env\n"
+            "Example: RECO_DB_URL=mysql+pymysql://user:pass@localhost:3306/dbname?charset=utf8mb4"
+        )
+
+    try:
+        engine = create_engine(
+            url,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            pool_timeout=30,
+            pool_size=5,
+            max_overflow=10,
+            echo=False  # برای debug می‌توانید True کنید
+        )
+        # تست اتصال
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")
+        print("✅ اتصال به پایگاه داده برقرار شد")
+        return engine
+    except Exception as e:
+        raise RuntimeError(f"خطا در اتصال به پایگاه داده: {e}\n"
+                          f"URL استفاده شده: {url}")
 
 
 def load_users() -> List[User]:
