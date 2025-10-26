@@ -125,9 +125,23 @@ def load_matomo_product_popularity() -> Dict[int, float]:
 def generate_recommendations_for_all_users(
     recommender: HybridRecommender,
     users_df: pl.DataFrame,
-    top_k: int = 20
+    top_k: int = 20,
+    sample_size: int = None
 ) -> pl.DataFrame:
-    """تولید توصیه برای همه کاربران"""
+    """
+    تولید توصیه برای کاربران
+    
+    Args:
+        recommender: مدل توصیه‌گر
+        users_df: DataFrame کاربران
+        top_k: تعداد توصیه برای هر کاربر
+        sample_size: تعداد کاربران برای تست (None = همه کاربران)
+    """
+    
+    # محدود کردن به sample اگر مشخص شده
+    if sample_size and sample_size < len(users_df):
+        users_df = users_df.head(sample_size)
+        print(f"\n⚠️  حالت تست: فقط {sample_size} کاربر اول پردازش می‌شود")
     
     recommendations_data = []
     
@@ -242,10 +256,19 @@ def print_sample_recommendations(recommendations_df: pl.DataFrame, products_df: 
         print()
 
 
-def main():
-    """تابع اصلی"""
+def main(sample_size: int = None):
+    """
+    تابع اصلی
+    
+    Args:
+        sample_size: تعداد کاربران برای تست (None = همه کاربران)
+    """
     print("="*80)
-    print("سیستم تولید توصیه محصولات برای همه کاربران")
+    print("سیستم تولید توصیه محصولات")
+    if sample_size:
+        print(f"🧪 حالت تست - {sample_size} کاربر")
+    else:
+        print("🚀 حالت کامل - همه کاربران")
     print("="*80)
     print()
     
@@ -365,12 +388,17 @@ def main():
         traceback.print_exc()
         return
     
-    # 8. تولید توصیه برای همه کاربران
-    print("\n🎯 تولید توصیه برای همه کاربران...")
+    # 8. تولید توصیه برای کاربران
+    if sample_size:
+        print(f"\n🎯 تولید توصیه برای {sample_size} کاربر (نمونه تست)...")
+    else:
+        print("\n🎯 تولید توصیه برای همه کاربران...")
+    
     recommendations_df = generate_recommendations_for_all_users(
         recommender,
         users_df,
-        top_k=20  # 20 توصیه برای هر کاربر
+        top_k=20,  # 20 توصیه برای هر کاربر
+        sample_size=sample_size
     )
     
     if recommendations_df.is_empty():
@@ -399,8 +427,47 @@ def main():
 
 if __name__ == "__main__":
     import sys
+    import argparse
+    
+    # تنظیم CLI arguments
+    parser = argparse.ArgumentParser(
+        description="تولید توصیه محصولات برای کاربران",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+مثال‌های استفاده:
+  # تست با 1000 کاربر
+  python generate_recommendations.py --sample 1000
+  
+  # تست با 100 کاربر
+  python generate_recommendations.py --sample 100
+  
+  # تولید برای همه کاربران
+  python generate_recommendations.py
+  python generate_recommendations.py --all
+        """
+    )
+    
+    parser.add_argument(
+        '--sample',
+        type=int,
+        default=None,
+        metavar='N',
+        help='تعداد کاربران برای تست (مثال: 1000). اگر مشخص نشود، همه کاربران پردازش می‌شوند.'
+    )
+    
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='پردازش همه کاربران (پیش‌فرض)'
+    )
+    
+    args = parser.parse_args()
+    
+    # اگر --all استفاده شده، sample_size رو None می‌کنیم
+    sample_size = None if args.all else args.sample
+    
     try:
-        main()
+        main(sample_size=sample_size)
     except KeyboardInterrupt:
         print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
         sys.exit(1)
