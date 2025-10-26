@@ -59,9 +59,8 @@ def load_config() -> Config:
 
     db_url = os.getenv("RECO_DB_URL")
 
-    # resolve output directory from env or fallback to default
-    storage_env = _env("STORAGE_PATH")
-    output_dir = storage_env or os.path.join("storage", "app", "recommendation")
+    # ensure output directory exists
+    output_dir = os.path.join("storage", "app", "recommendation")
     os.makedirs(output_dir, exist_ok=True)
 
     return Config(
