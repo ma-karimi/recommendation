@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+اسکریپت تولید توصیه‌ها برای همه کاربران
+این اسکریپت:
+1. داده‌های کاربران، محصولات و سفارشات را از دیتابیس می‌خواند
+2. داده‌های Matomo را از فایل‌های parquet می‌خواند
+3. سیستم توصیه را آموزش می‌دهد
+4. برای همه کاربران توصیه تولید می‌کند
+5. نتایج را در فایل parquet ذخیره می‌کند
+"""
+
+from __future__ import annotations
+import datetime as dt
+import os
+import glob
+from pathlib import Path
+from typing import List, Dict
+from collections import defaultdict
+
+import polars as pl
+import numpy as np
+
+from models import User, Product, ProductInteraction
+from data_loader import load_users, load_products
+from db_loader import load_order_items, get_engine
+from hybrid_recommender import HybridRecommender
+from settings import load_config
+from sqlalchemy import text
+
+
+def load_users_from_db() -> pl.DataFrame:
+    """بارگذاری کاربران از دیتابیس به صورت DataFrame"""
+    engine = get_engine()
+    sql = text("""
+        SELECT id, email, 
+               CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, '')) as name,
+               created_at
+        FROM users
+        ORDER BY id
+    """)
+    
+    with engine.connect() as conn:
+        rows = [dict(row) for row in conn.execute(sql).mappings()]
+    
+    if not rows:
+        return pl.DataFrame()
+    
+    return pl.DataFrame(rows)
+
+
+def load_products_from_db() -> pl.DataFrame:
+    """بارگذاری محصولات از دیتابیس به صورت DataFrame"""
+    engine = get_engine()
+    sql = text("""
+        SELECT id, title, slug, sku, sale_price, stock_quantity, 
+               status, published_at, seller_id, category_id
+        FROM products
+        WHERE deleted_at IS NULL AND status = 1
+        ORDER BY id
+    """)
+    
+    with engine.connect() as conn:
+        rows = [dict(row) for row in conn.execute(sql).mappings()]
+    
+    if not rows:
+        return pl.DataFrame()
+    
+    return pl.DataFrame(rows)
+
+
+def create_user_product_interactions(order_items_df: pl.DataFrame) -> List[ProductInteraction]:
+    """ایجاد لیست تعاملات کاربر-محصول از داده‌های سفارشات"""
+    interactions = []
+    
+    if order_items_df.is_empty():
+        return interactions
+    
+    # تبدیل به دیکشنری برای پردازش سریع‌تر
+    for row in order_items_df.iter_rows(named=True):
+        interaction = ProductInteraction(
+            user_id=row['order_user_id'],
+            product_id=row['product_id'],
+            interaction_type='purchase',
+            timestamp=row['order_created_at'],
+            value=float(row['total_price'])
+        )
+        interactions.append(interaction)
+    
+    print(f"✅ تعداد {len(interactions)} تعامل خرید استخراج شد")
+    return interactions
+
+
+def load_matomo_product_popularity() -> Dict[int, float]:
+    """بارگذاری محبوبیت محصولات از داده‌های Matomo"""
+    cfg = load_config()
+    pageviews_files = sorted(glob.glob(
+        os.path.join(cfg.output_dir, "matomo_pageviews_*.parquet")
+    ))
+    
+    if not pageviews_files:
+        print("⚠️  فایل Matomo pageviews یافت نشد")
+        return {}
+    
+    # استفاده از آخرین فایل
+    latest_file = pageviews_files[-1]
+    df = pl.read_parquet(latest_file)
+    
+    product_popularity = {}
+    
+    # فیلتر کردن صفحات محصول و استخراج محبوبیت
+    if 'label' in df.columns and 'nb_visits' in df.columns:
+        product_rows = df.filter(pl.col('label') == 'product')
+        
+        for row in product_rows.iter_rows(named=True):
+            # استخراج product_id از URL یا label
+            # این قسمت نیاز به تنظیم بر اساس ساختار URL‌های شما دارد
+            # فعلاً فقط تعداد بازدید کلی محصولات را نگه می‌داریم
+            popularity_score = float(row['nb_visits'])
+            product_popularity[0] = popularity_score  # کلیدی برای محصولات عمومی
+    
+    print(f"✅ داده‌های محبوبیت Matomo بارگذاری شد")
+    return product_popularity
+
+
+def generate_recommendations_for_all_users(
+    recommender: HybridRecommender,
+    users_df: pl.DataFrame,
+    top_k: int = 20
+) -> pl.DataFrame:
+    """تولید توصیه برای همه کاربران"""
+    
+    recommendations_data = []
+    
+    print(f"\n{'='*60}")
+    print(f"شروع تولید توصیه برای {len(users_df)} کاربر...")
+    print(f"{'='*60}\n")
+    
+    # شمارنده برای نمایش پیشرفت
+    total_users = len(users_df)
+    users_with_recommendations = 0
+    users_without_recommendations = 0
+    
+    for idx, row in enumerate(users_df.iter_rows(named=True), 1):
+        user_id = row['id']
+        
+        # نمایش پیشرفت
+        if idx % 100 == 0 or idx == total_users:
+            print(f"پردازش کاربر {idx}/{total_users} (کاربر ID: {user_id})...")
+        
+        try:
+            # دریافت توصیه‌ها
+            recommendations = recommender.get_recommendations(user_id, top_k)
+            
+            if recommendations:
+                users_with_recommendations += 1
+                
+                # اضافه کردن توصیه‌ها به لیست
+                for rank, rec in enumerate(recommendations, 1):
+                    recommendations_data.append({
+                        'user_id': user_id,
+                        'product_id': rec.product_id,
+                        'score': rec.score,
+                        'rank': rank,
+                        'confidence': rec.confidence,
+                        'reason': rec.reason,
+                        'generated_at': dt.datetime.now()
+                    })
+            else:
+                users_without_recommendations += 1
+                
+        except Exception as e:
+            users_without_recommendations += 1
+            if idx <= 10:  # فقط 10 خطای اول را نمایش می‌دهیم
+                print(f"  ⚠️  خطا برای کاربر {user_id}: {e}")
+    
+    print(f"\n{'='*60}")
+    print(f"خلاصه نتایج:")
+    print(f"  ✅ کاربران با توصیه: {users_with_recommendations}")
+    print(f"  ⚠️  کاربران بدون توصیه: {users_without_recommendations}")
+    print(f"  📊 تعداد کل توصیه‌ها: {len(recommendations_data)}")
+    print(f"{'='*60}\n")
+    
+    if not recommendations_data:
+        print("❌ هیچ توصیه‌ای تولید نشد!")
+        return pl.DataFrame()
+    
+    # تبدیل به DataFrame
+    recommendations_df = pl.DataFrame(recommendations_data)
+    
+    return recommendations_df
+
+
+def save_recommendations(recommendations_df: pl.DataFrame, output_dir: str) -> str:
+    """ذخیره توصیه‌ها در فایل parquet"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(output_dir, f"user_recommendations_{timestamp}.parquet")
+    
+    recommendations_df.write_parquet(output_file)
+    
+    print(f"✅ توصیه‌ها در فایل ذخیره شد: {output_file}")
+    
+    # ذخیره نسخه CSV برای بررسی راحت‌تر
+    csv_file = output_file.replace('.parquet', '.csv')
+    recommendations_df.write_csv(csv_file)
+    print(f"✅ نسخه CSV ذخیره شد: {csv_file}")
+    
+    return output_file
+
+
+def print_sample_recommendations(recommendations_df: pl.DataFrame, products_df: pl.DataFrame, n_users: int = 5):
+    """نمایش نمونه‌ای از توصیه‌ها"""
+    if recommendations_df.is_empty():
+        return
+    
+    # تبدیل محصولات به دیکشنری برای جستجوی سریع
+    products_dict = {}
+    for row in products_df.iter_rows(named=True):
+        products_dict[row['id']] = row['title']
+    
+    print(f"\n{'='*80}")
+    print(f"نمونه توصیه‌ها برای {n_users} کاربر اول:")
+    print(f"{'='*80}\n")
+    
+    # گروه‌بندی بر اساس user_id
+    unique_users = recommendations_df['user_id'].unique().sort()[:n_users]
+    
+    for user_id in unique_users:
+        user_recs = recommendations_df.filter(pl.col('user_id') == user_id).sort('rank')
+        
+        print(f"کاربر {user_id} - {len(user_recs)} توصیه:")
+        print("-" * 80)
+        
+        # نمایش 5 توصیه اول
+        for row in user_recs.head(5).iter_rows(named=True):
+            product_title = products_dict.get(row['product_id'], f"محصول {row['product_id']}")
+            print(f"  {row['rank']}. {product_title}")
+            print(f"     امتیاز: {row['score']:.4f} | اطمینان: {row['confidence']:.2f}")
+            print(f"     دلیل: {row['reason'][:100]}...")
+        
+        print()
+
+
+def main():
+    """تابع اصلی"""
+    print("="*80)
+    print("سیستم تولید توصیه محصولات برای همه کاربران")
+    print("="*80)
+    print()
+    
+    cfg = load_config()
+    
+    # 1. بارگذاری کاربران
+    print("📥 بارگذاری کاربران از دیتابیس...")
+    users_df = load_users_from_db()
+    if users_df.is_empty():
+        print("❌ هیچ کاربری یافت نشد!")
+        return
+    print(f"✅ {len(users_df)} کاربر بارگذاری شد")
+    
+    # 2. بارگذاری محصولات
+    print("\n📥 بارگذاری محصولات از دیتابیس...")
+    products_df = load_products_from_db()
+    if products_df.is_empty():
+        print("❌ هیچ محصولی یافت نشد!")
+        return
+    print(f"✅ {len(products_df)} محصول بارگذاری شد")
+    
+    # 3. بارگذاری سفارشات (آخر 180 روز)
+    print("\n📥 بارگذاری سفارشات از دیتابیس...")
+    end_date = dt.date.today()
+    start_date = end_date - dt.timedelta(days=180)  # 6 ماه گذشته
+    
+    order_items_df = load_order_items(start_date, end_date)
+    if order_items_df.is_empty():
+        print("⚠️  هیچ سفارشی در 180 روز گذشته یافت نشد!")
+        print("   تلاش برای بارگذاری تمام سفارشات...")
+        # سعی می‌کنیم تمام سفارشات را بارگذاری کنیم
+        start_date = dt.date(2020, 1, 1)
+        order_items_df = load_order_items(start_date, end_date)
+        
+        if order_items_df.is_empty():
+            print("❌ هیچ سفارشی یافت نشد! سیستم توصیه نیاز به داده دارد.")
+            return
+    
+    print(f"✅ {len(order_items_df)} آیتم سفارش بارگذاری شد")
+    print(f"   بازه زمانی: {start_date} تا {end_date}")
+    
+    # 4. ایجاد تعاملات کاربر-محصول
+    print("\n🔄 ایجاد ماتریس تعاملات کاربر-محصول...")
+    interactions = create_user_product_interactions(order_items_df)
+    
+    if not interactions:
+        print("❌ هیچ تعاملی ایجاد نشد!")
+        return
+    
+    # 5. بارگذاری محبوبیت محصولات از Matomo (اختیاری)
+    print("\n📥 بارگذاری داده‌های محبوبیت از Matomo...")
+    matomo_popularity = load_matomo_product_popularity()
+    
+    # 6. تبدیل داده‌ها به فرمت مدل‌ها
+    print("\n🔄 تبدیل داده‌ها به فرمت مدل‌ها...")
+    users_list = []
+    for row in users_df.iter_rows(named=True):
+        from models import User
+        users_list.append(User(
+            id=row['id'],
+            email=row.get('email'),
+            name=row.get('name'),
+            created_at=row.get('created_at')
+        ))
+    
+    products_list = []
+    for row in products_df.iter_rows(named=True):
+        from models import Product
+        products_list.append(Product(
+            id=row['id'],
+            title=row['title'],
+            slug=row['slug'],
+            sku=row['sku'],
+            sale_price=float(row['sale_price'] or 0),
+            stock_quantity=int(row['stock_quantity'] or 0),
+            status='published' if row['status'] == 1 else 'draft',
+            published_at=row.get('published_at'),
+            seller_id=row.get('seller_id'),
+            category_id=row.get('category_id')
+        ))
+    
+    # 7. آموزش سیستم توصیه
+    print("\n🧠 آموزش سیستم توصیه...")
+    print("   این ممکن است چند دقیقه طول بکشد...")
+    
+    recommender = HybridRecommender()
+    
+    # تنظیم داده‌ها به صورت دستی
+    recommender.users = users_list
+    recommender.products = products_list
+    
+    # گروه‌بندی تعاملات بر اساس user_id
+    user_interactions = defaultdict(list)
+    for interaction in interactions:
+        user_interactions[interaction.user_id].append(interaction)
+    
+    recommender.user_interactions = dict(user_interactions)
+    
+    print(f"   تعداد کاربران با تعامل: {len(user_interactions)}")
+    
+    # آموزش مدل‌ها
+    try:
+        from collaborative_filtering import train_collaborative_model
+        from content_based_filtering import train_content_based_model
+        
+        print("   🔹 آموزش مدل Collaborative Filtering...")
+        recommender.collaborative_model = train_collaborative_model(interactions)
+        
+        print("   🔹 آموزش مدل Content-Based Filtering...")
+        recommender.content_model = train_content_based_model(products_list, user_interactions)
+        
+        print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
+        
+    except Exception as e:
+        print(f"❌ خطا در آموزش مدل: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # 8. تولید توصیه برای همه کاربران
+    print("\n🎯 تولید توصیه برای همه کاربران...")
+    recommendations_df = generate_recommendations_for_all_users(
+        recommender,
+        users_df,
+        top_k=20  # 20 توصیه برای هر کاربر
+    )
+    
+    if recommendations_df.is_empty():
+        print("❌ هیچ توصیه‌ای تولید نشد!")
+        return
+    
+    # 9. ذخیره توصیه‌ها
+    print("\n💾 ذخیره توصیه‌ها...")
+    output_file = save_recommendations(recommendations_df, cfg.output_dir)
+    
+    # 10. نمایش نمونه توصیه‌ها
+    print_sample_recommendations(recommendations_df, products_df, n_users=5)
+    
+    # 11. آمار نهایی
+    print(f"\n{'='*80}")
+    print("✅ فرآیند تولید توصیه با موفقیت کامل شد!")
+    print(f"{'='*80}")
+    print(f"📊 آمار نهایی:")
+    print(f"   تعداد کاربران: {len(users_df)}")
+    print(f"   تعداد محصولات: {len(products_df)}")
+    print(f"   تعداد سفارشات: {len(order_items_df)}")
+    print(f"   تعداد کل توصیه‌ها: {len(recommendations_df)}")
+    print(f"   فایل خروجی: {output_file}")
+    print(f"{'='*80}\n")
+
+
+if __name__ == "__main__":
+    import sys
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\n❌ خطای غیرمنتظره: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
