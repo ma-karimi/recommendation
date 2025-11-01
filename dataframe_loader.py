@@ -1,3 +1,10 @@
+"""
+dataframe_loader.py - DataFrame-based data loading
+این ماژول داده‌ها را به صورت Polars DataFrames برمی‌گرداند
+مناسب برای: پردازش داده، Machine Learning، و تحلیل
+
+نکته: برای Object-based loading از object_loader.py استفاده کنید
+"""
 from __future__ import annotations
 import datetime as dt
 import os
@@ -71,11 +78,13 @@ def load_products() -> pl.DataFrame:
             p.seller_id,
             p.category_id
         FROM products p
-        WHERE p.deleted_at IS NULL
+        WHERE p.deleted_at IS NULL 
+          AND p.status = 1
+          AND p.stock_quantity > 0
         """
     )
     with engine.connect() as conn:
-        rows = list(conn.execute(sql).mappings())
+        rows = [dict(row) for row in conn.execute(sql).mappings()]
     return pl.DataFrame(rows) if rows else pl.DataFrame([])
 
 
@@ -110,5 +119,5 @@ def load_order_items(start_date: dt.date, end_date: dt.date) -> pl.DataFrame:
         "end_dt": f"{end_date} 23:59:59",
     }
     with get_engine().connect() as conn:
-        rows = list(conn.execute(sql, params).mappings())
+        rows = [dict(row) for row in conn.execute(sql, params).mappings()]
     return pl.DataFrame(rows) if rows else pl.DataFrame([])

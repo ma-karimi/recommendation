@@ -1,55 +1,33 @@
+"""
+object_loader.py - Object-based data loading
+این ماژول داده‌ها را به صورت Python objects برمی‌گرداند (List[User], List[Product], etc.)
+مناسب برای: API، OOP، و کارهای شیء‌گرا
+
+نکته: برای DataFrame-based loading از dataframe_loader.py استفاده کنید
+"""
 from __future__ import annotations
 import datetime as dt
 from typing import List, Optional
 import polars as pl
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy import text
 
 from models import User, Product, Order, OrderItem, UserBehavior, ProductInteraction
-from settings import load_config
-
-
-def get_engine() -> Engine:
-    """ایجاد اتصال به پایگاه داده"""
-    cfg = load_config()
-    url = (cfg.db.url or "").strip()
-    if not url:
-        raise RuntimeError(
-            "Database URL not configured. Set RECO_DB_URL in .env\n"
-            "Example: RECO_DB_URL=mysql+pymysql://user:pass@localhost:3306/dbname?charset=utf8mb4"
-        )
-
-    try:
-        engine = create_engine(
-            url,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            pool_timeout=30,
-            pool_size=5,
-            max_overflow=10,
-            echo=False  # برای debug می‌توانید True کنید
-        )
-        # تست اتصال
-        with engine.connect() as conn:
-            conn.execute("SELECT 1")
-        print("✅ اتصال به پایگاه داده برقرار شد")
-        return engine
-    except Exception as e:
-        raise RuntimeError(f"خطا در اتصال به پایگاه داده: {e}\n"
-                          f"URL استفاده شده: {url}")
+from dataframe_loader import get_engine  # استفاده از get_engine مشترک
 
 
 def load_users() -> List[User]:
     """بارگذاری کاربران"""
     engine = get_engine()
     sql = text("""
-        SELECT id, email, name, created_at
+        SELECT id, email, 
+               CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, '')) as name,
+               created_at
         FROM users
-        WHERE deleted_at IS NULL
+        ORDER BY id
     """)
     
     with engine.connect() as conn:
-        rows = conn.execute(sql).mappings()
+        rows = list(conn.execute(sql).mappings())
         return [User(
             id=row['id'],
             email=row.get('email'),
@@ -65,19 +43,20 @@ def load_products() -> List[Product]:
         SELECT id, title, slug, sku, sale_price, stock_quantity, status, 
                published_at, seller_id, category_id
         FROM products
-        WHERE deleted_at IS NULL AND status = 'published'
+        WHERE deleted_at IS NULL AND status = 1
+        ORDER BY id
     """)
     
     with engine.connect() as conn:
-        rows = conn.execute(sql).mappings()
+        rows = list(conn.execute(sql).mappings())
         return [Product(
             id=row['id'],
             title=row['title'],
             slug=row['slug'],
-            sku=row['sku'],
+            sku=row.get('sku', ''),
             sale_price=float(row['sale_price'] or 0),
             stock_quantity=int(row['stock_quantity'] or 0),
-            status=row['status'],
+            status='published' if row['status'] == 1 else 'draft',
             published_at=row.get('published_at'),
             seller_id=row.get('seller_id'),
             category_id=row.get('category_id')
@@ -116,11 +95,13 @@ def load_order_items(start_date: dt.date, end_date: dt.date) -> List[OrderItem]:
     engine = get_engine()
     sql = text("""
         SELECT oi.id, oi.order_id, oi.product_id, oi.variety_id as variant_id,
-               oi.quantity, oi.price, oi.sale_price, oi.total_price, oi.created_at
+               oi.quantity, oi.price, oi.sale_price, oi.total_price, oi.created_at,
+               o.user_id, o.created_at as order_created_at
         FROM order_items oi
         INNER JOIN orders o ON o.id = oi.order_id
         WHERE o.created_at >= :start_date AND o.created_at <= :end_date
         AND o.status = 'completed'
+        ORDER BY o.created_at
     """)
     
     params = {
@@ -129,7 +110,7 @@ def load_order_items(start_date: dt.date, end_date: dt.date) -> List[OrderItem]:
     }
     
     with engine.connect() as conn:
-        rows = conn.execute(sql, params).mappings()
+        rows = list(conn.execute(sql, params).mappings())
         return [OrderItem(
             id=row['id'],
             order_id=row['order_id'],
