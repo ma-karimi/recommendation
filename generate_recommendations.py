@@ -21,8 +21,8 @@ import polars as pl
 import numpy as np
 
 from models import User, Product, ProductInteraction
-from data_loader import load_users, load_products
-from db_loader import load_order_items, get_engine
+from object_loader import load_users, load_products
+from dataframe_loader import load_order_items, get_engine
 from hybrid_recommender import HybridRecommender
 from settings import load_config
 from sqlalchemy import text

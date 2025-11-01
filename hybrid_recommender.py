@@ -6,7 +6,7 @@ from collections import defaultdict
 from models import User, Product, ProductInteraction, Recommendation
 from collaborative_filtering import CollaborativeFiltering, train_collaborative_model
 from content_based_filtering import ContentBasedFiltering, train_content_based_model
-from data_loader import load_users, load_products, load_user_purchase_history
+from object_loader import load_users, load_products, load_user_purchase_history
 
 
 class HybridRecommender:

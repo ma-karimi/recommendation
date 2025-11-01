@@ -5,7 +5,7 @@ import os
 
 import polars as pl
 
-from db_loader import load_products, load_order_items
+from dataframe_loader import load_products, load_order_items
 from settings import load_config
 from matomo_client import load_matomo_client
 

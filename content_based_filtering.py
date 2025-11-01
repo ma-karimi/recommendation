@@ -8,7 +8,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import re
 
 from models import User, Product, ProductInteraction, Recommendation
-from data_loader import load_user_purchase_history
+from object_loader import load_user_purchase_history
 
 
 class ContentBasedFiltering:
@@ -271,3 +271,5 @@ def train_content_based_model(products: List[Product],
     model.build_product_similarity_matrix(product_features)
     model.build_user_profiles(user_interactions, product_features)
     return model
+
+

@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from hybrid_recommender import HybridRecommender
 from models import Recommendation, User, Product
-from data_loader import load_users, load_products
+from object_loader import load_users, load_products
 
 
 # مدل‌های Pydantic برای API
@@ -250,3 +250,5 @@ async def get_system_stats():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+

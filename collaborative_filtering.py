@@ -5,7 +5,7 @@ from collections import defaultdict
 import math
 
 from models import User, Product, ProductInteraction, Recommendation
-from data_loader import load_user_purchase_history
+from object_loader import load_user_purchase_history
 
 
 class CollaborativeFiltering:
