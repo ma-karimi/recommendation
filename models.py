@@ -82,3 +82,4 @@ class Recommendation:
     score: float
     reason: str  # توضیح دلیل توصیه
     confidence: float  # میزان اطمینان (0-1)
+    collaborative_details: Optional[str] = None  # جزئیات کاربران مشابه (JSON string)

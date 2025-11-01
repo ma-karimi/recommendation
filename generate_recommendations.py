@@ -177,6 +177,7 @@ def generate_recommendations_for_all_users(
                         'rank': rank,
                         'confidence': rec.confidence,
                         'reason': rec.reason,
+                        'collaborative_details': rec.collaborative_details,
                         'generated_at': dt.datetime.now()
                     })
             else:
@@ -252,6 +253,10 @@ def print_sample_recommendations(recommendations_df: pl.DataFrame, products_df: 
             print(f"  {row['rank']}. {product_title}")
             print(f"     امتیاز: {row['score']:.4f} | اطمینان: {row['confidence']:.2f}")
             print(f"     دلیل: {row['reason'][:100]}...")
+            
+            # نمایش جزئیات collaborative اگر وجود داشته باشد
+            if 'collaborative_details' in row and row['collaborative_details']:
+                print(f"     جزئیات: {row['collaborative_details'][:150]}...")
         
         print()
 

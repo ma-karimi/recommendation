@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Dict, Tuple
 from collections import defaultdict
 import math
+import json
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
@@ -104,38 +105,67 @@ class CollaborativeFiltering:
         # محاسبه امتیاز پیش‌بینی برای هر محصول
         predictions = []
         for product_idx, product_id in unseen_products:
-            score = self._predict_rating(user_idx, product_idx)
+            score, similar_users_details = self._predict_rating(user_idx, product_idx)
             if score > 0:
-                predictions.append((product_id, score))
+                predictions.append((product_id, score, similar_users_details))
         
         # مرتب‌سازی و انتخاب بهترین‌ها
         predictions.sort(key=lambda x: x[1], reverse=True)
         
         recommendations = []
-        for product_id, score in predictions[:top_k]:
+        for product_id, score, similar_users_details in predictions[:top_k]:
+            # ساخت جزئیات JSON
+            if similar_users_details:
+                # محدود کردن به 5 کاربر مشابه برتر
+                top_similar = similar_users_details[:5]
+                details_json = json.dumps({
+                    'similar_users': [
+                        {'user_id': user_id, 'similarity': round(sim, 4), 
+                         'similarity_percent': round(sim * 100, 2)}
+                        for user_id, sim in top_similar
+                    ],
+                    'total_similar_users': len(similar_users_details)
+                }, ensure_ascii=False)
+                
+                # ساخت reason با جزئیات
+                similar_users_str = ', '.join([f"user_{uid}" for uid, _ in top_similar])
+                reason = f"Collaborative: {len(similar_users_details)} کاربران مشابه ({similar_users_str}) این محصول را خریده‌اند"
+            else:
+                details_json = None
+                reason = "Collaborative: توصیه بر اساس رفتار کاربران مشابه"
+            
             recommendations.append(Recommendation(
                 user_id=user_id,
                 product_id=product_id,
                 score=score,
-                reason="توصیه بر اساس رفتار کاربران مشابه",
-                confidence=min(score / 5.0, 1.0)
+                reason=reason,
+                confidence=min(score / 5.0, 1.0),
+                collaborative_details=details_json
             ))
         
         return recommendations
     
-    def _predict_rating(self, user_idx: int, product_idx: int) -> float:
-        """پیش‌بینی امتیاز محصول برای کاربر"""
+    def _predict_rating(self, user_idx: int, product_idx: int) -> Tuple[float, List[Tuple[int, float]]]:
+        """پیش‌بینی امتیاز محصول برای کاربر و برگرداندن جزئیات کاربران مشابه"""
         similarities = self.user_similarities[user_idx]
         ratings = self.user_item_matrix[:, product_idx]
         
         # پیدا کردن کاربران مشابه که این محصول را خریده‌اند
         similar_users = []
+        similar_users_details = []
+        
         for other_user_idx, similarity in enumerate(similarities):
             if other_user_idx != user_idx and ratings[other_user_idx] > 0:
                 similar_users.append((similarity, ratings[other_user_idx]))
+                # ذخیره جزئیات (user_id, similarity)
+                other_user_id = self.index_to_user[other_user_idx]
+                similar_users_details.append((other_user_id, similarity))
         
         if not similar_users:
-            return 0.0
+            return 0.0, []
+        
+        # مرتب‌سازی بر اساس شباهت (برای نمایش دقیق‌تر)
+        similar_users_details.sort(key=lambda x: x[1], reverse=True)
         
         # محاسبه میانگین وزنی
         total_weight = 0.0
@@ -147,9 +177,9 @@ class CollaborativeFiltering:
                 weighted_sum += similarity * rating
         
         if total_weight == 0:
-            return 0.0
+            return 0.0, []
         
-        return weighted_sum / total_weight
+        return weighted_sum / total_weight, similar_users_details
     
     def get_similar_users(self, user_id: int, top_k: int = 5) -> List[Tuple[int, float]]:
         """دریافت کاربران مشابه"""

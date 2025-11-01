@@ -70,9 +70,9 @@ class HybridRecommender:
         # دریافت توصیه‌های collaborative filtering
         if self.collaborative_model:
             collab_recs = self.collaborative_model.get_user_recommendations(user_id, top_k * 2)
+            # نکته: reason و collaborative_details قبلاً در مدل collaborative تنظیم شده است
             for rec in collab_recs:
                 rec.score *= self.collaborative_weight
-                rec.reason = f"Collaborative: {rec.reason}"
             recommendations.extend(collab_recs)
         
         # دریافت توصیه‌های content-based filtering
@@ -111,12 +111,20 @@ class HybridRecommender:
                 combined_confidence = max(rec.confidence for rec in recs)
                 combined_reason = " + ".join(set(rec.reason for rec in recs))
                 
+                # حفظ collaborative_details اگر یکی از rec ها آن را دارد
+                collaborative_details = None
+                for rec in recs:
+                    if rec.collaborative_details:
+                        collaborative_details = rec.collaborative_details
+                        break
+                
                 final_rec = Recommendation(
                     user_id=recs[0].user_id,
                     product_id=product_id,
                     score=combined_score,
                     reason=combined_reason,
-                    confidence=combined_confidence
+                    confidence=combined_confidence,
+                    collaborative_details=collaborative_details
                 )
             
             final_recommendations.append(final_rec)
