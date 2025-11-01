@@ -8,6 +8,7 @@
 
 - [📋 خلاصه تغییرات](#خلاصه-تغییرات)
 - [📊 آمار دیتابیس](#آمار-دیتابیس)
+- [💻 نیازمندی‌های منابع](#نیازمندی‌های-منابع)
 - [🚀 نحوه استفاده](#نحوه-استفاده)
 - [🔧 ساختار پروژه](#ساختار-پروژه)
 - [📁 ساختار فایل خروجی](#ساختار-فایل-خروجی)
@@ -91,6 +92,48 @@ python generate_recommendations.py --help
 
 ---
 
+## 💻 نیازمندی‌های منابع
+
+با توجه به آمار فعلی سیستم شما:
+- **224,959 کاربر**
+- **36,114 محصول فعال**
+- **4,499,180 توصیه (20 به ازای هر کاربر)**
+
+### 📊 حجم حافظه مورد نیاز
+
+```
+حجم فعلی در Redis:  ~1.6 GB
+با Overhead:         ~2.4 GB
+RAM مورد نیاز:       4 GB (توصیه می‌شود)
+```
+
+### 💰 توصیه سرور برای شروع
+
+**گزینه 1: کوچک (توصیه می‌شود):**
+- RAM: 4 GB
+- CPU: 2 vCPU
+- Storage: 20 GB
+- **هزینه:** ~$18-24/month
+
+**گزینه 2: متوسط (رشد 1-3 سال):**
+- RAM: 8 GB
+- CPU: 4 vCPU  
+- Storage: 50 GB
+- **هزینه:** ~$36-48/month
+
+### 📈 پیش‌بینی رشد
+
+| دوره | کاربران | حجم Redis | RAM مورد نیاز |
+|------|---------|-----------|---------------|
+| فعلی | 224K | 1.6 GB | 4 GB |
+| 1 سال | 337K | 2.4 GB | 4-8 GB |
+| 2 سال | 450K | 3.2 GB | 8 GB |
+| 3 سال | 675K | 4.8 GB | 8-12 GB |
+
+> 📄 برای جزئیات بیشتر، فایل `RESOURCE_REQUIREMENTS.md` را مطالعه کنید.
+
+---
+
 ## 🚀 نحوه استفاده
 
 ### مرحله 1: تست اتصال (اختیاری)
@@ -129,8 +172,8 @@ python generate_recommendations.py
 2. مدل‌های Collaborative و Content-Based را آموزش می‌دهد
 3. برای **همه 224,959 کاربر** توصیه تولید می‌کند (20 توصیه به ازای هر کاربر)
 4. نتایج را در فایل‌های زیر ذخیره می‌کند:
-   - `storage/app/recommendation/user_recommendations_YYYYMMDD_HHMMSS.parquet`
-   - `storage/app/recommendation/user_recommendations_YYYYMMDD_HHMMSS.csv`
+- `storage/app/recommendation/user_recommendations_YYYYMMDD_HHMMSS.parquet`
+- `storage/app/recommendation/user_recommendations_YYYYMMDD_HHMMSS.csv`
 
 **نکته:** این فرآیند ممکن است 15-45 دقیقه طول بکشد.
 
@@ -278,6 +321,49 @@ recommendation/
 
 ## 📧 استفاده در Laravel
 
+### روش 1: استفاده از Redis (توصیه می‌شود - سریع‌ترین) ⚡
+
+```php
+<?php
+use Illuminate\Support\Facades\Redis;
+
+// دریافت توصیه‌های کاربر از Redis
+$userId = 123;
+$key = "recommendation:{$userId}";
+$recommendations = json_decode(Redis::get($key), true);
+
+if ($recommendations) {
+    // نمایش توصیه‌ها
+    foreach ($recommendations as $rec) {
+        echo "Product ID: {$rec['product_id']}\n";
+        echo "Score: {$rec['score']}\n";
+        echo "Reason: {$rec['reason']}\n";
+        echo "Confidence: {$rec['confidence']}\n";
+        
+        // نمایش جزئیات Collaborative اگر موجود باشد
+        if (!empty($rec['collaborative_details'])) {
+            $details = json_decode($rec['collaborative_details'], true);
+            echo "Similar Users: " . $details['total_similar_users'] . "\n";
+            
+            foreach ($details['similar_users'] as $user) {
+                echo "  - User {$user['user_id']}: {$user['similarity_percent']}% similar\n";
+            }
+        }
+    }
+} else {
+    // Fallback: دریافت از CSV یا تولید مستقیم
+    echo "توصیه‌ای در Redis موجود نیست";
+}
+```
+
+**مزایا Redis:**
+- ⚡ سرعت بالا (O(1) read/write)
+- 💾 حافظه بهینه
+- 🔄 TTL خودکار (7 روز)
+- ✅ بهترین گزینه برای caching
+
+### روش 2: استفاده از فایل CSV (fallback)
+
 ```php
 <?php
 use Illuminate\Support\Facades\DB;
@@ -296,22 +382,53 @@ $recommendations = collect(array_map('str_getcsv', file($csv)))
             'rank' => $row[3],
             'confidence' => $row[4],
             'reason' => $row[5],
+            'collaborative_details' => $row[6] ?? null,
         ];
     })
     ->where('user_id', $userId)
     ->take(10);
+```
 
-// یا import کردن به جدول MySQL
-// CREATE TABLE user_recommendations (
-//     user_id BIGINT,
-//     product_id BIGINT,
-//     score FLOAT,
-//     rank INT,
-//     confidence FLOAT,
-//     reason TEXT,
-//     generated_at TIMESTAMP,
-//     INDEX(user_id)
-// );
+### تنظیمات Redis در `.env` Laravel
+
+```env
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=null
+REDIS_TTL_SECONDS=604800  # 7 days
+```
+
+---
+
+## 🗄️ استفاده از Redis
+
+سیستم به صورت خودکار توصیه‌ها را در Redis ذخیره می‌کند. Redis انتخاب بهتری نسبت به MongoDB است:
+
+| ویژگی | Redis ✅ | MongoDB |
+|-------|---------|---------|
+| سرعت | خیلی سریع (O(1)) | سریع |
+| حافظه | بهینه | متوسط |
+| TTL | ✅ خودکار | ❌ دستی |
+| پیچیدگی | ساده | پیچیده‌تر |
+| مناسب برای | Caching | Analytics |
+
+**ساختار کلیدهای Redis:**
+- `recommendation:{user_id}` → JSON array با 20 توصیه
+- `recommendation_meta:{user_id}` → metadata (تاریخ، تعداد، etc.)
+
+**نحوه نصب Redis:**
+```bash
+# macOS
+brew install redis
+brew services start redis
+
+# Linux (Ubuntu/Debian)
+sudo apt install redis-server
+sudo systemctl start redis
+
+# تست اتصال
+redis-cli ping  # باید PONG برگرداند
 ```
 
 ---
