@@ -412,7 +412,28 @@ def main(sample_size: int = None):
     
     # 9. ذخیره توصیه‌ها
     print("\n💾 ذخیره توصیه‌ها...")
+    
+    # ذخیره در فایل (backup)
     output_file = save_recommendations(recommendations_df, cfg.output_dir)
+    
+    # ذخیره در Redis
+    try:
+        from recommendation_storage import get_storage
+        storage = get_storage()
+        
+        if storage.test_connection():
+            stats = storage.store_batch_from_dataframe(recommendations_df, batch_size=1000)
+            storage_stats = storage.get_stats()
+            print(f"\n📊 آمار Redis:")
+            print(f"   تعداد توصیه‌ها در حافظه: {storage_stats['total_recommendations']}")
+            print(f"   استفاده از حافظه: {storage_stats['memory_usage_mb']} MB")
+        else:
+            print("⚠️  Redis در دسترس نیست - فقط فایل ذخیره شد")
+    except ImportError:
+        print("⚠️  ماژول recommendation_storage پیدا نشد - فقط فایل ذخیره شد")
+    except Exception as e:
+        print(f"⚠️  خطا در ذخیره Redis: {e}")
+        print("   ✅ فایل‌ها به درستی ذخیره شدند")
     
     # 10. نمایش نمونه توصیه‌ها
     print_sample_recommendations(recommendations_df, products_df, n_users=5)

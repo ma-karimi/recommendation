@@ -19,6 +19,7 @@ class RecommendationResponse(BaseModel):
     product_title: Optional[str] = None
     product_price: Optional[float] = None
     product_stock: Optional[int] = None
+    collaborative_details: Optional[Dict[str, Any]] = None  # جزئیات collaborative
 
 
 class UserInsightsResponse(BaseModel):
@@ -45,6 +46,20 @@ class SimilarProductsResponse(BaseModel):
 # متغیر سراسری برای مدل
 recommender: Optional[HybridRecommender] = None
 products_cache: Dict[int, Product] = {}
+storage = None  # Redis storage
+
+def init_redis_storage():
+    """دریافت یا initialize کردن Redis storage"""
+    global storage
+    if storage is None:
+        try:
+            from recommendation_storage import get_storage
+            storage = get_storage()
+        except ImportError:
+            print("⚠️  recommendation_storage در دسترس نیست")
+        except Exception as e:
+            print(f"⚠️  خطا در اتصال به Redis: {e}")
+    return storage
 
 
 @asynccontextmanager
@@ -120,15 +135,60 @@ async def health_check():
 async def get_user_recommendations(
     user_id: int,
     limit: int = 10,
-    recommender_instance: HybridRecommender = Depends(get_recommender)
+    use_redis: bool = True
 ):
-    """دریافت توصیه‌های کاربر"""
+    """دریافت توصیه‌های کاربر از Redis یا تولید مستقیم"""
     try:
+        # تلاش برای خواندن از Redis
+        if use_redis:
+            storage = init_redis_storage()
+            if storage and storage.exists(user_id):
+                recs_dict = storage.get_recommendations(user_id)
+                
+                response = []
+                for rec in recs_dict[:limit]:
+                    product_info = get_product_info(rec['product_id'])
+                    
+                    # Parse collaborative_details if exists
+                    collaborative_details = None
+                    if rec.get('collaborative_details'):
+                        import json
+                        try:
+                            collaborative_details = json.loads(rec['collaborative_details'])
+                        except:
+                            pass
+                    
+                    response.append(RecommendationResponse(
+                        product_id=rec['product_id'],
+                        score=rec['score'],
+                        reason=rec['reason'],
+                        confidence=rec['confidence'],
+                        product_title=product_info.get("product_title"),
+                        product_price=product_info.get("product_price"),
+                        product_stock=product_info.get("product_stock"),
+                        collaborative_details=collaborative_details
+                    ))
+                
+                if response:
+                    return response
+        
+        # Fallback: تولید توصیه مستقیم
+        recommender_instance = get_recommender()
         recommendations = recommender_instance.get_recommendations(user_id, limit)
         
         response = []
         for rec in recommendations:
             product_info = get_product_info(rec.product_id)
+            
+            # Parse collaborative_details if exists
+            collaborative_details = None
+            if rec.collaborative_details:
+                import json
+                try:
+                    collaborative_details = json.loads(rec.collaborative_details)
+                except:
+                    pass
+            
             response.append(RecommendationResponse(
                 product_id=rec.product_id,
                 score=rec.score,
@@ -136,7 +196,8 @@ async def get_user_recommendations(
                 confidence=rec.confidence,
                 product_title=product_info.get("product_title"),
                 product_price=product_info.get("product_price"),
-                product_stock=product_info.get("product_stock")
+                product_stock=product_info.get("product_stock"),
+                collaborative_details=collaborative_details
             ))
         
         return response
