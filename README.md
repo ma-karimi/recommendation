@@ -431,6 +431,43 @@ sudo systemctl start redis
 redis-cli ping  # باید PONG برگرداند
 ```
 
+### نحوه استفاده از توصیه‌های ذخیره شده
+
+#### در Python:
+
+```python
+from recommendation_storage import get_storage
+
+# دریافت توصیه‌ها برای یک کاربر
+storage = get_storage()
+recommendations = storage.get_recommendations(user_id=123)
+
+if recommendations:
+    for rec in recommendations:
+        print(f"Product: {rec['product_id']}")
+        print(f"Score: {rec['score']}")
+        print(f"Reason: {rec['reason']}")
+        
+        # نمایش جزئیات Collaborative
+        if rec.get('collaborative_details'):
+            import json
+            details = json.loads(rec['collaborative_details'])
+            print(f"Similar Users: {details['total_similar_users']}")
+```
+
+#### بررسی سریع (بدون دریافت کامل):
+
+```python
+# بررسی وجود توصیه‌ها (سریع)
+exists = storage.exists(user_id=123)
+
+# دریافت metadata
+metadata = storage.get_metadata(user_id=123)
+print(f"تولید شده: {metadata['generated_at']}")
+```
+
+> 💡 برای مثال‌های بیشتر، فایل `examples_usage.py` را مشاهده کنید.
+
 ---
 
 ## 🎯 مراحل بعدی

@@ -67,20 +67,25 @@ async def lifespan(app: FastAPI):
     """مدیریت چرخه حیات اپلیکیشن"""
     global recommender, products_cache
     
-    # بارگذاری اولیه
-    print("شروع بارگذاری سیستم توصیه...")
-    recommender = HybridRecommender()
-    recommender.train()
+    # بارگذاری اولیه (فقط کش محصولات - توصیه‌ها از Redis خوانده می‌شوند)
+    print("شروع بارگذاری API...")
     
     # کش محصولات برای پاسخ سریع
     products = load_products()
     products_cache = {p.id: p for p in products}
-    print(f"سیستم توصیه آماده شد - {len(products_cache)} محصول")
+    print(f"✅ {len(products_cache)} محصول کش شد")
+    
+    # تست اتصال به Redis
+    storage = init_redis_storage()
+    if storage and storage.test_connection():
+        print("✅ اتصال به Redis برقرار است")
+    else:
+        print("⚠️  Redis در دسترس نیست - استفاده از fallback")
     
     yield
     
     # پاکسازی
-    print("بستن سیستم توصیه...")
+    print("بستن API...")
 
 
 app = FastAPI(
@@ -91,10 +96,15 @@ app = FastAPI(
 )
 
 
-def get_recommender() -> HybridRecommender:
-    """دریافت نمونه سیستم توصیه"""
+def get_recommender() -> Optional[HybridRecommender]:
+    """دریافت نمونه سیستم توصیه (برای fallback)"""
+    global recommender
     if recommender is None:
-        raise HTTPException(status_code=503, detail="سیستم توصیه هنوز آماده نیست")
+        try:
+            recommender = HybridRecommender()
+            recommender.train()
+        except:
+            pass
     return recommender
 
 
@@ -172,36 +182,44 @@ async def get_user_recommendations(
                 if response:
                     return response
         
-        # Fallback: تولید توصیه مستقیم
+        # Fallback: اگر Redis در دسترس نباشد یا توصیه وجود نداشته باشد
         recommender_instance = get_recommender()
-        recommendations = recommender_instance.get_recommendations(user_id, limit)
-        
-        response = []
-        for rec in recommendations:
-            product_info = get_product_info(rec.product_id)
+        if recommender_instance:
+            recommendations = recommender_instance.get_recommendations(user_id, limit)
             
-            # Parse collaborative_details if exists
-            collaborative_details = None
-            if rec.collaborative_details:
-                import json
-                try:
-                    collaborative_details = json.loads(rec.collaborative_details)
-                except:
-                    pass
+            response = []
+            for rec in recommendations:
+                product_info = get_product_info(rec.product_id)
+                
+                # Parse collaborative_details if exists
+                collaborative_details = None
+                if rec.collaborative_details:
+                    import json
+                    try:
+                        collaborative_details = json.loads(rec.collaborative_details)
+                    except:
+                        pass
+                
+                response.append(RecommendationResponse(
+                    product_id=rec.product_id,
+                    score=rec.score,
+                    reason=rec.reason,
+                    confidence=rec.confidence,
+                    product_title=product_info.get("product_title"),
+                    product_price=product_info.get("product_price"),
+                    product_stock=product_info.get("product_stock"),
+                    collaborative_details=collaborative_details
+                ))
             
-            response.append(RecommendationResponse(
-                product_id=rec.product_id,
-                score=rec.score,
-                reason=rec.reason,
-                confidence=rec.confidence,
-                product_title=product_info.get("product_title"),
-                product_price=product_info.get("product_price"),
-                product_stock=product_info.get("product_stock"),
-                collaborative_details=collaborative_details
-            ))
-        
-        return response
+            return response
+        else:
+            raise HTTPException(
+                status_code=503, 
+                detail="توصیه‌ای برای این کاربر یافت نشد و سیستم در حال بارگذاری است"
+            )
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"خطا در دریافت توصیه‌ها: {str(e)}")
 
@@ -297,14 +315,17 @@ async def retrain_model():
 @app.get("/stats")
 async def get_system_stats():
     """دریافت آمار سیستم"""
-    if recommender is None:
-        raise HTTPException(status_code=503, detail="سیستم هنوز آماده نیست")
+    # دریافت آمار Redis
+    redis_stats = {}
+    storage = init_redis_storage()
+    if storage and storage.test_connection():
+        redis_stats = storage.get_stats()
     
     return {
         "total_products": len(products_cache),
-        "recommender_ready": True,
-        "collaborative_model_ready": recommender.collaborative_model is not None,
-        "content_model_ready": recommender.content_model is not None
+        "recommender_ready": recommender is not None,
+        "redis_connected": storage is not None and storage.test_connection() if storage else False,
+        "redis_stats": redis_stats
     }
 
 
