@@ -96,6 +96,7 @@ open http://localhost:8000/docs
 
 | سند | توضیح |
 |-----|-------|
+| [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md) | **🎓 راهنمای یادگیری** - آموزش کامل برای مبتدیان: مفاهیم، الگوریتم‌ها، فرآیندها و مثال‌ها |
 | [docs/GUIDE.md](docs/GUIDE.md) | **راهنمای کامل** - تمام جزئیات استفاده، API، تنظیمات، مثال‌ها و troubleshooting |
 | [docs/RESOURCE_REQUIREMENTS.md](docs/RESOURCE_REQUIREMENTS.md) | نیازمندی‌های منابع و پیش‌بینی رشد |
 | [docs/Recommendation_API.postman_collection.json](docs/Recommendation_API.postman_collection.json) | مجموعه Postman برای تست API |
