@@ -1,72 +1,92 @@
 #!/usr/bin/env python3
 """
 اسکریپت اجرای سیستم توصیه محصولات
+
+این اسکریپت امکان اجرای دستورات مختلف سیستم توصیه را فراهم می‌کند:
+- train: آموزش مدل
+- api: اجرای API سرور
+- recommend: دریافت توصیه‌ها برای یک کاربر
 """
 from __future__ import annotations
 import argparse
+import logging
 import sys
 from typing import Optional
 
+import uvicorn
+
 from hybrid_recommender import HybridRecommender
 from recommendation_api import app
-import uvicorn
+
+# تنظیم logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def run_training():
     """اجرای آموزش مدل"""
-    print("شروع آموزش سیستم توصیه...")
+    logger.info("Starting recommendation system training...")
     
     try:
         recommender = HybridRecommender()
         recommender.train()
-        print("✅ آموزش مدل با موفقیت انجام شد")
+        logger.info("Model training completed successfully")
         
         # تست سیستم
-        print("\nتست سیستم...")
+        logger.info("Testing system...")
         users = recommender.users
         if users:
             test_user = users[0]
             recommendations = recommender.get_recommendations(test_user.id, 5)
-            print(f"توصیه‌های نمونه برای کاربر {test_user.id}:")
+            logger.info(f"Sample recommendations for user {test_user.id}:")
             for rec in recommendations:
-                print(f"  - محصول {rec.product_id}: {rec.score:.2f} ({rec.reason})")
+                logger.info(f"  - Product {rec.product_id}: {rec.score:.2f} ({rec.reason})")
         
         return True
         
     except Exception as e:
-        print(f"❌ خطا در آموزش مدل: {e}")
+        logger.error(f"Error during model training: {e}", exc_info=True)
         return False
 
 
 def run_api(host: str = "0.0.0.0", port: int = 8000):
     """اجرای API سرور"""
-    print(f"شروع API سرور روی {host}:{port}")
-    print("📖 مستندات API: http://localhost:8000/docs")
-    print("🔍 بررسی سلامت: http://localhost:8000/health")
+    logger.info(f"Starting API server on {host}:{port}")
+    logger.info(f"📖 API Documentation: http://localhost:{port}/docs")
+    logger.info(f"🔍 Health Check: http://localhost:{port}/health")
     
-    uvicorn.run(app, host=host, port=port)
+    try:
+        uvicorn.run(app, host=host, port=port)
+    except Exception as e:
+        logger.error(f"Error running API server: {e}", exc_info=True)
+        sys.exit(1)
 
 
 def get_recommendations_for_user(user_id: int, limit: int = 10):
     """دریافت توصیه‌های کاربر"""
     try:
+        logger.info(f"Getting recommendations for user {user_id}...")
         recommender = HybridRecommender()
         recommender.train()
         
         recommendations = recommender.get_recommendations(user_id, limit)
         
-        print(f"توصیه‌های کاربر {user_id}:")
+        logger.info(f"Found {len(recommendations)} recommendations for user {user_id}:")
         for i, rec in enumerate(recommendations, 1):
-            print(f"{i}. محصول {rec.product_id}")
-            print(f"   امتیاز: {rec.score:.2f}")
-            print(f"   دلیل: {rec.reason}")
-            print(f"   اطمینان: {rec.confidence:.2f}")
-            print()
+            logger.info(
+                f"{i}. Product {rec.product_id} - "
+                f"Score: {rec.score:.2f}, "
+                f"Confidence: {rec.confidence:.2f} - "
+                f"Reason: {rec.reason}"
+            )
         
         return recommendations
         
     except Exception as e:
-        print(f"❌ خطا در دریافت توصیه‌ها: {e}")
+        logger.error(f"Error getting recommendations for user {user_id}: {e}", exc_info=True)
         return []
 
 

@@ -16,8 +16,10 @@ recommendation_storage.py - ذخیره و بازیابی توصیه‌ها از 
 """
 from __future__ import annotations
 import json
+import logging
 import datetime as dt
 from typing import List, Optional, Dict, Any
+
 import polars as pl
 
 try:
@@ -28,6 +30,9 @@ except ImportError:
     ConnectionPool = None
 
 from models import Recommendation
+
+# تنظیم logger
+logger = logging.getLogger(__name__)
 
 
 class RecommendationStorage:
@@ -139,10 +144,14 @@ class RecommendationStorage:
                 json.dumps(metadata, ensure_ascii=False)
             )
             
+            logger.debug(f"Stored {len(recommendations)} recommendations for user {user_id}")
             return True
             
+        except (redis.RedisError, json.JSONEncodeError, ValueError) as e:
+            logger.error(f"Error storing recommendations for user {user_id}: {e}", exc_info=True)
+            return False
         except Exception as e:
-            print(f"❌ خطا در ذخیره توصیه‌های کاربر {user_id}: {e}")
+            logger.error(f"Unexpected error storing recommendations for user {user_id}: {e}", exc_info=True)
             return False
     
     def get_recommendations(self, user_id: int) -> List[Dict[str, Any]]:
@@ -163,10 +172,14 @@ class RecommendationStorage:
                 return []
             
             recommendations = json.loads(data)
+            logger.debug(f"Retrieved {len(recommendations)} recommendations for user {user_id}")
             return recommendations
             
+        except (redis.RedisError, json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Error retrieving recommendations for user {user_id}: {e}", exc_info=True)
+            return []
         except Exception as e:
-            print(f"❌ خطا در دریافت توصیه‌های کاربر {user_id}: {e}")
+            logger.error(f"Unexpected error retrieving recommendations for user {user_id}: {e}", exc_info=True)
             return []
     
     def get_metadata(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -180,16 +193,24 @@ class RecommendationStorage:
             
             return json.loads(data)
             
+        except (redis.RedisError, json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Error retrieving metadata for user {user_id}: {e}", exc_info=True)
+            return None
         except Exception as e:
-            print(f"❌ خطا در دریافت metadata کاربر {user_id}: {e}")
+            logger.error(f"Unexpected error retrieving metadata for user {user_id}: {e}", exc_info=True)
             return None
     
     def exists(self, user_id: int) -> bool:
         """بررسی وجود توصیه‌ها برای کاربر"""
         try:
             key = self._get_key(user_id)
-            return self.client.exists(key) > 0
-        except:
+            exists = self.client.exists(key) > 0
+            return exists
+        except redis.RedisError as e:
+            logger.warning(f"Error checking existence for user {user_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking existence for user {user_id}: {e}", exc_info=True)
             return False
     
     def delete(self, user_id: int) -> bool:
@@ -201,9 +222,13 @@ class RecommendationStorage:
             self.client.delete(key)
             self.client.delete(meta_key)
             
+            logger.debug(f"Deleted recommendations for user {user_id}")
             return True
+        except redis.RedisError as e:
+            logger.error(f"Error deleting recommendations for user {user_id}: {e}", exc_info=True)
+            return False
         except Exception as e:
-            print(f"❌ خطا در حذف توصیه‌های کاربر {user_id}: {e}")
+            logger.error(f"Unexpected error deleting recommendations for user {user_id}: {e}", exc_info=True)
             return False
     
     def store_batch_from_dataframe(
@@ -230,7 +255,7 @@ class RecommendationStorage:
         users = recommendations_df['user_id'].unique().sort()
         stats['total_users'] = len(users)
         
-        print(f"\n💾 شروع ذخیره {len(users)} کاربر در Redis...")
+        logger.info(f"Starting batch storage for {len(users)} users in Redis...")
         
         # پردازش batch به batch
         for i in range(0, len(users), batch_size):
@@ -243,68 +268,79 @@ class RecommendationStorage:
                 
                 # تبدیل به لیست Recommendation
                 recommendations = []
-                for row in user_recs_df.iter_rows(named=True):
-                    rec = Recommendation(
-                        user_id=int(row['user_id']),
-                        product_id=int(row['product_id']),
-                        score=float(row['score']),
-                        reason=row.get('reason', ''),
-                        confidence=float(row.get('confidence', 0.0)),
-                        collaborative_details=row.get('collaborative_details')
-                    )
-                    recommendations.append(rec)
+                try:
+                    for row in user_recs_df.iter_rows(named=True):
+                        rec = Recommendation(
+                            user_id=int(row['user_id']),
+                            product_id=int(row['product_id']),
+                            score=float(row['score']),
+                            reason=row.get('reason', ''),
+                            confidence=float(row.get('confidence', 0.0)),
+                            collaborative_details=row.get('collaborative_details')
+                        )
+                        recommendations.append(rec)
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"Error processing recommendations for user {user_id}: {e}")
+                    stats['failed_count'] += 1
+                    continue
                 
                 # ذخیره
                 if self.store_recommendations(user_id, recommendations):
                     stats['success_count'] += 1
+                    if len(recommendations) > 0:
+                        logger.debug(f"Stored {len(recommendations)} recommendations for user {user_id}")
                 else:
                     stats['failed_count'] += 1
-                
-                # نمایش پیشرفت
-                if len(recommendations) > 0:
-                    print(f"  ✅ کاربر {user_id}: {len(recommendations)} توصیه ذخیره شد", end='\r')
             
             # نمایش progress
             processed = min(i + batch_size, len(users))
-            print(f"\n  📊 پیشرفت: {processed}/{len(users)} کاربر ({processed*100//len(users)}%)")
+            logger.info(f"Progress: {processed}/{len(users)} users ({processed*100//len(users)}%)")
         
-        print(f"\n{'='*60}")
-        print(f"✅ ذخیره‌سازی تکمیل شد!")
-        print(f"  ✅ موفق: {stats['success_count']} کاربر")
-        print(f"  ❌ ناموفق: {stats['failed_count']} کاربر")
-        print(f"{'='*60}\n")
+        logger.info(
+            f"Batch storage completed: {stats['success_count']} succeeded, "
+            f"{stats['failed_count']} failed"
+        )
         
         return stats
     
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self) -> Dict[str, Any]:
         """دریافت آمار کلی از Redis"""
         try:
             keys = self.client.keys("recommendation:*")
+            memory_info = self.client.info('memory')
             return {
                 'total_recommendations': len(keys),
                 'memory_usage_mb': round(
-                    self.client.info('memory')['used_memory'] / 1024 / 1024, 2
+                    memory_info['used_memory'] / 1024 / 1024, 2
                 )
             }
-        except:
+        except redis.RedisError as e:
+            logger.error(f"Error getting Redis stats: {e}", exc_info=True)
+            return {'total_recommendations': 0, 'memory_usage_mb': 0}
+        except Exception as e:
+            logger.error(f"Unexpected error getting Redis stats: {e}", exc_info=True)
             return {'total_recommendations': 0, 'memory_usage_mb': 0}
     
     def test_connection(self) -> bool:
         """تست اتصال به Redis"""
         try:
             self.client.ping()
-            print("✅ اتصال به Redis برقرار است")
+            logger.info("Redis connection test successful")
             return True
+        except redis.RedisError as e:
+            logger.error(f"Redis connection test failed: {e}")
+            return False
         except Exception as e:
-            print(f"❌ خطا در اتصال به Redis: {e}")
+            logger.error(f"Unexpected error testing Redis connection: {e}", exc_info=True)
             return False
     
     def close(self):
         """بستن اتصال"""
         try:
             self.client.close()
-        except:
-            pass
+            logger.debug("Redis connection closed")
+        except Exception as e:
+            logger.warning(f"Error closing Redis connection: {e}")
 
 
 def get_storage() -> RecommendationStorage:

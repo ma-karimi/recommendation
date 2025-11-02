@@ -1,31 +1,45 @@
+"""
+تنظیمات سیستم
+
+این ماژول تنظیمات را از environment variables بارگذاری می‌کند.
+"""
 import os
 from dataclasses import dataclass
+from typing import Optional
+
 from dotenv import load_dotenv
+
 
 @dataclass
 class MatomoConfig:
+    """تنظیمات Matomo analytics"""
     base_url: str
     site_id: str
     token_auth: str
     verify_ssl: bool = True
 
+
 @dataclass
 class DBConfig:
-    url: str | None = None
+    """تنظیمات دیتابیس"""
+    url: Optional[str] = None
 
 @dataclass
 class RedisConfig:
+    """تنظیمات Redis"""
     host: str = "localhost"
     port: int = 6379
     db: int = 0
-    password: str | None = None
+    password: Optional[str] = None
     ttl_seconds: int = 604800  # 7 days
+
 
 @dataclass
 class Config:
+    """تنظیمات کلی سیستم"""
     matomo: MatomoConfig
     db: DBConfig
-    redis: RedisConfig = None
+    redis: Optional[RedisConfig] = None
     output_dir: str = os.path.join("storage", "app", "recommendation")
 
 

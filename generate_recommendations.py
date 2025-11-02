@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
 """
 اسکریپت تولید توصیه‌ها برای همه کاربران
+
 این اسکریپت:
 1. داده‌های کاربران، محصولات و سفارشات را از دیتابیس می‌خواند
 2. داده‌های Matomo را از فایل‌های parquet می‌خواند
 3. سیستم توصیه را آموزش می‌دهد
 4. برای همه کاربران توصیه تولید می‌کند
-5. نتایج را در فایل parquet ذخیره می‌کند
+5. نتایج را در فایل parquet و Redis ذخیره می‌کند
 """
-
 from __future__ import annotations
 import datetime as dt
-import os
 import glob
+import logging
+import os
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict
-from collections import defaultdict
 
-import polars as pl
 import numpy as np
-
-from models import User, Product, ProductInteraction
-from object_loader import load_users, load_products
-from dataframe_loader import load_order_items, get_engine
-from hybrid_recommender import HybridRecommender
-from settings import load_config
+import polars as pl
 from sqlalchemy import text
+
+from dataframe_loader import get_engine, load_order_items
+from hybrid_recommender import HybridRecommender
+from models import Product, ProductInteraction, User
+from object_loader import load_products, load_users
+from settings import load_config
+
+# تنظیم logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def load_users_from_db() -> pl.DataFrame:
@@ -86,7 +94,7 @@ def create_user_product_interactions(order_items_df: pl.DataFrame) -> List[Produ
         )
         interactions.append(interaction)
     
-    print(f"✅ تعداد {len(interactions)} تعامل خرید استخراج شد")
+    logger.info(f"Extracted {len(interactions)} purchase interactions")
     return interactions
 
 
@@ -98,7 +106,7 @@ def load_matomo_product_popularity() -> Dict[int, float]:
     ))
     
     if not pageviews_files:
-        print("⚠️  فایل Matomo pageviews یافت نشد")
+        logger.warning("Matomo pageviews file not found")
         return {}
     
     # استفاده از آخرین فایل
@@ -118,7 +126,7 @@ def load_matomo_product_popularity() -> Dict[int, float]:
             popularity_score = float(row['nb_visits'])
             product_popularity[0] = popularity_score  # کلیدی برای محصولات عمومی
     
-    print(f"✅ داده‌های محبوبیت Matomo بارگذاری شد")
+    logger.info("Matomo popularity data loaded")
     return product_popularity
 
 
@@ -141,13 +149,11 @@ def generate_recommendations_for_all_users(
     # محدود کردن به sample اگر مشخص شده
     if sample_size and sample_size < len(users_df):
         users_df = users_df.head(sample_size)
-        print(f"\n⚠️  حالت تست: فقط {sample_size} کاربر اول پردازش می‌شود")
+        logger.warning(f"Test mode: Only processing first {sample_size} users")
     
     recommendations_data = []
     
-    print(f"\n{'='*60}")
-    print(f"شروع تولید توصیه برای {len(users_df)} کاربر...")
-    print(f"{'='*60}\n")
+    logger.info(f"Starting recommendation generation for {len(users_df)} users...")
     
     # شمارنده برای نمایش پیشرفت
     total_users = len(users_df)
@@ -159,7 +165,7 @@ def generate_recommendations_for_all_users(
         
         # نمایش پیشرفت
         if idx % 100 == 0 or idx == total_users:
-            print(f"پردازش کاربر {idx}/{total_users} (کاربر ID: {user_id})...")
+            logger.info(f"Processing user {idx}/{total_users} (User ID: {user_id})...")
         
         try:
             # دریافت توصیه‌ها
@@ -186,17 +192,16 @@ def generate_recommendations_for_all_users(
         except Exception as e:
             users_without_recommendations += 1
             if idx <= 10:  # فقط 10 خطای اول را نمایش می‌دهیم
-                print(f"  ⚠️  خطا برای کاربر {user_id}: {e}")
+                logger.warning(f"Error for user {user_id}: {e}")
     
-    print(f"\n{'='*60}")
-    print(f"خلاصه نتایج:")
-    print(f"  ✅ کاربران با توصیه: {users_with_recommendations}")
-    print(f"  ⚠️  کاربران بدون توصیه: {users_without_recommendations}")
-    print(f"  📊 تعداد کل توصیه‌ها: {len(recommendations_data)}")
-    print(f"{'='*60}\n")
+    logger.info(
+        f"Summary: {users_with_recommendations} users with recommendations, "
+        f"{users_without_recommendations} without. "
+        f"Total recommendations: {len(recommendations_data)}"
+    )
     
     if not recommendations_data:
-        print("❌ هیچ توصیه‌ای تولید نشد!")
+        logger.error("No recommendations generated!")
         return pl.DataFrame()
     
     # تبدیل به DataFrame
@@ -213,13 +218,12 @@ def save_recommendations(recommendations_df: pl.DataFrame, output_dir: str) -> s
     output_file = os.path.join(output_dir, f"user_recommendations_{timestamp}.parquet")
     
     recommendations_df.write_parquet(output_file)
-    
-    print(f"✅ توصیه‌ها در فایل ذخیره شد: {output_file}")
+    logger.info(f"Recommendations saved to: {output_file}")
     
     # ذخیره نسخه CSV برای بررسی راحت‌تر
     csv_file = output_file.replace('.parquet', '.csv')
     recommendations_df.write_csv(csv_file)
-    print(f"✅ نسخه CSV ذخیره شد: {csv_file}")
+    logger.info(f"CSV version saved to: {csv_file}")
     
     return output_file
 
