@@ -1,21 +1,33 @@
 from __future__ import annotations
+import logging
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import math
 import json
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
+
+# تنظیم logger
+logger = logging.getLogger(__name__)
 
 
 class CollaborativeFiltering:
     """سیستم توصیه مبتنی بر همکاری کاربران"""
     
-    def __init__(self, min_common_items: int = 2):
+    def __init__(self, min_common_items: int = 2, n_jobs: int = 1):
+        """
+        Args:
+            min_common_items: حداقل تعداد آیتم مشترک برای محاسبه شباهت
+            n_jobs: تعداد هسته CPU برای محاسبه شباهت‌ها (1 = sequential)
+        """
         self.min_common_items = min_common_items
         self.user_item_matrix = None
         self.user_similarities = None
+        self.n_jobs = n_jobs
     
     def build_user_item_matrix(self, interactions: List[ProductInteraction]) -> None:
         """ساخت ماتریس کاربر-محصول"""
@@ -63,11 +75,45 @@ class CollaborativeFiltering:
                 self.user_item_matrix[user_idx, product_idx] = score
     
     def calculate_user_similarities(self) -> None:
-        """محاسبه شباهت بین کاربران"""
+        """
+        محاسبه شباهت بین کاربران (با پشتیبانی از multiprocessing)
+        
+        این متد شباهت کسینوسی بین همه جفت کاربران را محاسبه می‌کند
+        """
         n_users = self.user_item_matrix.shape[0]
         self.user_similarities = np.zeros((n_users, n_users))
         
+        logger.info(f"Calculating user similarities for {n_users} users...")
+        
+        # تعیین تعداد هسته‌ها
+        if self.n_jobs == -1:
+            n_jobs = cpu_count()
+        elif self.n_jobs <= 0:
+            n_jobs = 1
+        else:
+            n_jobs = self.n_jobs
+        
+        logger.info(f"Using {n_jobs} CPU core(s) for similarity calculation...")
+        
+        if n_jobs > 1 and n_users > 100:
+            # پردازش موازی
+            try:
+                self._calculate_similarities_parallel(n_jobs, n_users)
+            except Exception as e:
+                logger.warning(f"Parallel calculation failed, falling back to sequential: {e}")
+                self._calculate_similarities_sequential(n_users)
+        else:
+            # پردازش sequential
+            self._calculate_similarities_sequential(n_users)
+        
+        logger.info("User similarities calculated successfully!")
+    
+    def _calculate_similarities_sequential(self, n_users: int) -> None:
+        """محاسبه sequential شباهت‌ها"""
         for i in range(n_users):
+            if (i + 1) % 100 == 0:
+                logger.info(f"Processing user {i + 1}/{n_users}...")
+            
             for j in range(i + 1, n_users):
                 similarity = self._cosine_similarity(
                     self.user_item_matrix[i],
@@ -75,6 +121,41 @@ class CollaborativeFiltering:
                 )
                 self.user_similarities[i, j] = similarity
                 self.user_similarities[j, i] = similarity
+    
+    def _calculate_similarities_parallel(self, n_jobs: int, n_users: int) -> None:
+        """محاسبه موازی شباهت‌ها"""
+        # آماده‌سازی داده‌ها برای پردازش موازی
+        # هر task یک range از کاربران را پردازش می‌کند
+        tasks = []
+        chunk_size = max(50, n_users // (n_jobs * 2))
+        
+        for i in range(0, n_users, chunk_size):
+            end_i = min(i + chunk_size, n_users)
+            tasks.append((i, end_i, n_users))
+        
+        logger.info(f"Processing {len(tasks)} chunks in parallel...")
+        
+        # استفاده از Pool برای پردازش موازی
+        with Pool(processes=n_jobs) as pool:
+            results = pool.starmap(
+                _calculate_similarity_chunk_worker,
+                [
+                    (
+                        self.user_item_matrix,
+                        start_i,
+                        end_i,
+                        n_users
+                    )
+                    for start_i, end_i, n_users in tasks
+                ]
+            )
+        
+        # ترکیب نتایج
+        for chunk_similarities, start_i, end_i in results:
+            for i in range(start_i, end_i):
+                for j in range(n_users):
+                    if chunk_similarities[i - start_i, j] != 0:
+                        self.user_similarities[i, j] = chunk_similarities[i - start_i, j]
     
     def _cosine_similarity(self, user1: np.ndarray, user2: np.ndarray) -> float:
         """محاسبه شباهت کسینوسی"""
@@ -200,9 +281,84 @@ class CollaborativeFiltering:
         return similar_users[:top_k]
 
 
-def train_collaborative_model(interactions: List[ProductInteraction]) -> CollaborativeFiltering:
-    """آموزش مدل collaborative filtering"""
-    model = CollaborativeFiltering()
+def _calculate_similarity_chunk_worker(
+    user_item_matrix: np.ndarray,
+    start_i: int,
+    end_i: int,
+    n_users: int
+) -> Tuple[np.ndarray, int, int]:
+    """
+    Worker function برای محاسبه شباهت یک chunk از کاربران
+    
+    Args:
+        user_item_matrix: ماتریس کاربر-محصول
+        start_i: شاخص شروع کاربران
+        end_i: شاخص پایان کاربران
+        n_users: تعداد کل کاربران
+    
+    Returns:
+        Tuple of (chunk_similarities, start_i, end_i)
+    """
+    chunk_size = end_i - start_i
+    chunk_similarities = np.zeros((chunk_size, n_users))
+    
+    for i in range(start_i, end_i):
+        for j in range(n_users):
+            if i != j:
+                similarity = _cosine_similarity_helper(
+                    user_item_matrix[i],
+                    user_item_matrix[j]
+                )
+                chunk_similarities[i - start_i, j] = similarity
+    
+    return (chunk_similarities, start_i, end_i)
+
+
+def _cosine_similarity_helper(user1: np.ndarray, user2: np.ndarray) -> float:
+    """Helper function برای محاسبه شباهت کسینوسی (برای multiprocessing)"""
+    dot_product = np.dot(user1, user2)
+    norm1 = np.linalg.norm(user1)
+    norm2 = np.linalg.norm(user2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    return dot_product / (norm1 * norm2)
+
+
+def train_collaborative_model(
+    interactions: List[ProductInteraction],
+    n_jobs: int = -1
+) -> CollaborativeFiltering:
+    """
+    آموزش مدل collaborative filtering (با پشتیبانی از multiprocessing)
+    
+    Args:
+        interactions: لیست تعاملات کاربر-محصول
+        n_jobs: تعداد هسته CPU برای استفاده (-1 = همه هسته‌ها، 1 = sequential)
+    
+    Returns:
+        CollaborativeFiltering model
+    """
+    logger.info("Training Collaborative Filtering model...")
+    
+    # تعیین تعداد هسته‌ها
+    if n_jobs == -1:
+        n_jobs = cpu_count()
+    elif n_jobs <= 0:
+        n_jobs = 1
+
+    print(f"Using {n_jobs} CPU core(s) for training...")
+
+    logger.info(f"Using {n_jobs} CPU core(s) for training...")
+    
+    model = CollaborativeFiltering(n_jobs=n_jobs)
+    
+    logger.info("Building user-item matrix...")
     model.build_user_item_matrix(interactions)
+    
+    logger.info("Calculating user similarities...")
     model.calculate_user_similarities()
+    
+    logger.info("Collaborative Filtering model trained successfully!")
     return model

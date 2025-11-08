@@ -218,7 +218,6 @@ def generate_recommendations_for_all_users(
     elif n_jobs <= 0:
         n_jobs = 1
 
-    n_jobs = 4
     print("Using {n_jobs} CPU core(s) for processing ...")
     
     logger.info(f"Using {n_jobs} CPU core(s) for processing...")
@@ -476,7 +475,11 @@ def main(sample_size: int = None, n_jobs: int = -1):
         from content_based_filtering import train_content_based_model
         
         print("   🔹 آموزش مدل Collaborative Filtering...")
-        recommender.collaborative_model = train_collaborative_model(interactions)
+        # استفاده از چند هسته CPU برای آموزش
+        recommender.collaborative_model = train_collaborative_model(
+            interactions,
+            n_jobs=n_jobs
+        )
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
         # استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
