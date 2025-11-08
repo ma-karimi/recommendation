@@ -16,9 +16,8 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from multiprocessing import Pool, cpu_count
-from functools import partial
 
 import numpy as np
 import polars as pl
@@ -132,29 +131,35 @@ def load_matomo_product_popularity() -> Dict[int, float]:
     return product_popularity
 
 
-def _process_user_recommendations_worker(
-    user_data: tuple,
-    recommender: HybridRecommender,
-    top_k: int
-) -> List[Dict]:
+# Global variable برای multiprocessing (در هر worker process تنظیم می‌شود)
+_global_recommender = None
+
+def _init_worker(recommender: HybridRecommender):
+    """Initialize worker process with recommender object"""
+    global _global_recommender
+    _global_recommender = recommender
+
+def _process_single_user(user_data: tuple) -> List[Dict]:
     """
-    Worker function برای پردازش توصیه یک کاربر (برای multiprocessing)
+    Worker function برای پردازش یک کاربر
     
     Args:
-        user_data: (user_id, user_index, total_users)
-        recommender: مدل توصیه‌گر (shared)
-        top_k: تعداد توصیه
+        user_data: (user_id, user_index, total_users, top_k)
     
     Returns:
         List of recommendation dictionaries
     """
-    user_id, user_index, total_users = user_data
+    user_id, user_index, total_users, top_k = user_data
     
     recommendations_data = []
     
     try:
+        if _global_recommender is None:
+            logger.error(f"Recommender not initialized in worker process for user {user_id}")
+            return recommendations_data
+        
         # دریافت توصیه‌ها
-        recommendations = recommender.get_recommendations(user_id, top_k)
+        recommendations = _global_recommender.get_recommendations(user_id, top_k)
         
         if recommendations:
             # اضافه کردن توصیه‌ها به لیست
@@ -175,7 +180,6 @@ def _process_user_recommendations_worker(
     
     return recommendations_data
 
-
 def generate_recommendations_for_all_users(
     recommender: HybridRecommender,
     users_df: pl.DataFrame,
@@ -191,7 +195,7 @@ def generate_recommendations_for_all_users(
         users_df: DataFrame کاربران
         top_k: تعداد توصیه برای هر کاربر
         sample_size: تعداد کاربران برای تست (None = همه کاربران)
-        n_jobs: تعداد thread/core برای پردازش موازی (-1 = همه هسته‌ها)
+        n_jobs: تعداد هسته CPU برای استفاده (-1 = همه هسته‌ها، 1 = sequential)
     """
     
     # محدود کردن به sample اگر مشخص شده
@@ -204,7 +208,7 @@ def generate_recommendations_for_all_users(
     
     # آماده‌سازی داده‌های کاربران
     user_data_list = [
-        (row['id'], idx + 1, total_users)
+        (row['id'], idx + 1, total_users, top_k)
         for idx, row in enumerate(users_df.iter_rows(named=True))
     ]
     
@@ -213,62 +217,67 @@ def generate_recommendations_for_all_users(
         n_jobs = cpu_count()
     elif n_jobs <= 0:
         n_jobs = 1
+
+    n_jobs = 4
+    print("Using {n_jobs} CPU core(s) for processing ...")
     
-    logger.info(f"Using {n_jobs} CPU cores for parallel processing...")
+    logger.info(f"Using {n_jobs} CPU core(s) for processing...")
     
     # پردازش موازی یا sequential
     all_recommendations_data = []
     users_with_recommendations = 0
     users_without_recommendations = 0
     
-    if n_jobs > 1 and total_users > 100:
+    if n_jobs > 1 and total_users > 50:
         # پردازش موازی برای تعداد زیاد کاربران
-        # توجه: recommender باید pickleable باشد
         try:
-            with Pool(processes=n_jobs) as pool:
-                # پردازش batch به batch برای جلوگیری از مصرف زیاد حافظه
-                batch_size = 1000
-                for i in range(0, len(user_data_list), batch_size):
-                    batch = user_data_list[i:i + batch_size]
+            with Pool(
+                processes=n_jobs,
+                initializer=_init_worker,
+                initargs=(recommender,)
+            ) as pool:
+                    # پردازش batch به batch برای جلوگیری از مصرف زیاد حافظه
+                    batch_size = max(100, total_users // (n_jobs * 4))  # تقسیم به batch‌های مناسب
                     
-                    results = pool.starmap(
-                        _process_user_recommendations_worker,
-                        [
-                            (user_data, recommender, top_k)
-                            for user_data in batch
-                        ]
-                    )
-                    
-                    # ترکیب نتایج
-                    for recs in results:
-                        if recs:
-                            all_recommendations_data.extend(recs)
-                            users_with_recommendations += 1
-                        else:
-                            users_without_recommendations += 1
-                    
-                    # نمایش پیشرفت
-                    processed = min(i + batch_size, total_users)
-                    logger.info(
-                        f"Progress: {processed}/{total_users} users "
-                        f"({processed*100//total_users}%) - "
-                        f"{len(all_recommendations_data)} recommendations generated"
-                    )
+                    for i in range(0, len(user_data_list), batch_size):
+                        batch = user_data_list[i:i + batch_size]
+                        
+                        # پردازش batch
+                        results = pool.map(_process_single_user, batch)
+                        
+                        # ترکیب نتایج
+                        for recs in results:
+                            if recs:
+                                all_recommendations_data.extend(recs)
+                                users_with_recommendations += 1
+                            else:
+                                users_without_recommendations += 1
+                        
+                        # نمایش پیشرفت
+                        processed = min(i + batch_size, total_users)
+                        progress = (processed * 100) // total_users
+                        logger.info(
+                            f"Progress: {processed}/{total_users} users ({progress}%) - "
+                            f"{len(all_recommendations_data)} recommendations generated"
+                        )
         except Exception as e:
             logger.warning(f"Parallel processing failed, falling back to sequential: {e}")
+            import traceback
+            traceback.print_exc()
             # Fallback به sequential
             n_jobs = 1
     
     if n_jobs == 1:
         # پردازش sequential
+        logger.info("Processing users sequentially...")
         for idx, user_data in enumerate(user_data_list, 1):
-            user_id, user_index, total_users = user_data
+            user_id, user_index, total_users, top_k = user_data
             
             # نمایش پیشرفت
             if idx % 100 == 0 or idx == total_users:
                 logger.info(f"Processing user {idx}/{total_users} (User ID: {user_id})...")
             
-            recs = _process_user_recommendations_worker(user_data, recommender, top_k)
+            recs = _process_single_user(user_data)
             
             if recs:
                 all_recommendations_data.extend(recs)
@@ -347,12 +356,13 @@ def print_sample_recommendations(recommendations_df: pl.DataFrame, products_df: 
         print()
 
 
-def main(sample_size: int = None):
+def main(sample_size: int = None, n_jobs: int = -1):
     """
     تابع اصلی
     
     Args:
         sample_size: تعداد کاربران برای تست (None = همه کاربران)
+        n_jobs: تعداد هسته CPU برای استفاده (-1 = همه هسته‌ها)
     """
     print("="*80)
     print("سیستم تولید توصیه محصولات")
@@ -469,15 +479,12 @@ def main(sample_size: int = None):
         recommender.collaborative_model = train_collaborative_model(interactions)
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
-        # استفاده از Sparse Matrix و بهینه‌سازی حافظه (80% RAM)
+        # استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
         recommender.content_model = train_content_based_model(
             products_list, 
             user_interactions,
             use_sparse=True,  # استفاده از Sparse Matrix
-            max_similar_products=None,  # None = محاسبه خودکار بر اساس حافظه
-            n_jobs=-1,  # استفاده از تمام هسته‌های CPU
-            target_memory_usage_percent=0.8,  # استفاده از 80% حافظه RAM
-            auto_optimize_memory=True  # بهینه‌سازی خودکار حافظه
+            max_similar_products=50  # حداکثر 50 محصول مشابه برای هر محصول
         )
         
         print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
@@ -498,7 +505,8 @@ def main(sample_size: int = None):
         recommender,
         users_df,
         top_k=20,  # 20 توصیه برای هر کاربر
-        sample_size=sample_size
+        sample_size=sample_size,
+        n_jobs=n_jobs  # استفاده از هسته‌های CPU
     )
     
     if recommendations_df.is_empty():
@@ -582,13 +590,21 @@ if __name__ == "__main__":
         help='پردازش همه کاربران (پیش‌فرض)'
     )
     
+    parser.add_argument(
+        '--jobs',
+        type=int,
+        default=-1,
+        metavar='N',
+        help='تعداد هسته CPU برای استفاده (پیش‌فرض: -1 = همه هسته‌ها، 1 = sequential)'
+    )
+    
     args = parser.parse_args()
     
     # اگر --all استفاده شده، sample_size رو None می‌کنیم
     sample_size = None if args.all else args.sample
     
     try:
-        main(sample_size=sample_size)
+        main(sample_size=sample_size, n_jobs=args.jobs)
     except KeyboardInterrupt:
         print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
         sys.exit(1)
