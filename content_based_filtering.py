@@ -1,11 +1,12 @@
 """
-Content-Based Filtering با بهینه‌سازی حافظه
+Content-Based Filtering با بهینه‌سازی حافظه و پردازش موازی
 
 بهینه‌سازی‌ها:
 - استفاده از Sparse Matrix برای ذخیره شباهت‌ها
 - محاسبه شباهت فقط برای محصولات مرتبط (همان دسته‌بندی)
 - محاسبه Lazy (فقط وقتی نیاز است)
 - کاهش استفاده از حافظه از 11.9 GB به < 1 GB
+- پردازش موازی با استفاده از تمام هسته‌های CPU
 """
 from __future__ import annotations
 import logging
@@ -13,10 +14,19 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import math
+import os
+from multiprocessing import Pool, cpu_count
+from functools import partial
 from scipy.sparse import csr_matrix, save_npz, load_npz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+    logger.warning("psutil not installed. Install with: pip install psutil")
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
@@ -24,14 +34,116 @@ from object_loader import load_user_purchase_history
 # تنظیم logger
 logger = logging.getLogger(__name__)
 
+
+def get_available_memory_mb() -> float:
+    """دریافت حافظه RAM موجود به مگابایت"""
+    if psutil is not None:
+        try:
+            memory = psutil.virtual_memory()
+            return memory.available / (1024 * 1024)  # تبدیل به MB
+        except Exception as e:
+            logger.warning(f"Error getting memory from psutil: {e}")
+    
+    # Fallback: استفاده از os.sysconf در Linux/Mac
+    try:
+        if hasattr(os, 'sysconf'):
+            # Linux/Mac
+            total_memory = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+            return total_memory / (1024 * 1024)
+    except Exception:
+        pass
+    
+    # Default: فرض 8 GB
+    logger.warning("Could not detect available memory, assuming 8 GB")
+    return 8 * 1024
+
+
+def calculate_optimal_max_similar_products(
+    n_products: int,
+    target_memory_usage_percent: float = 0.8,
+    similarity_threshold: float = 0.1
+) -> int:
+    """
+    محاسبه حداکثر تعداد محصولات مشابه بر اساس حافظه موجود
+    
+    Args:
+        n_products: تعداد کل محصولات
+        target_memory_usage_percent: درصد حافظه مورد استفاده (0.8 = 80%)
+        similarity_threshold: حداقل شباهت برای ذخیره
+    
+    Returns:
+        حداکثر تعداد محصولات مشابه برای هر محصول
+    """
+    available_memory_mb = get_available_memory_mb()
+    target_memory_mb = available_memory_mb * target_memory_usage_percent
+    
+    logger.info(f"Available RAM: {available_memory_mb:.2f} MB")
+    logger.info(f"Target memory usage ({target_memory_usage_percent*100}%): {target_memory_mb:.2f} MB")
+    
+    # محاسبه حافظه مورد نیاز برای هر similarity entry
+    # هر entry شامل: product_id (int64 = 8 bytes) + similarity (float64 = 8 bytes) = 16 bytes
+    bytes_per_similarity = 16
+    
+    # محاسبه حافظه برای Sparse Matrix
+    # CSR format: data (float64), indices (int32), indptr (int64)
+    # تقریبی: برای هر non-zero element حدود 16 bytes
+    bytes_per_sparse_element = 16
+    
+    # محاسبه حافظه برای نگاشت‌ها
+    # product_to_index و index_to_product: هر کدام n_products * 8 bytes
+    mapping_memory_mb = (n_products * 8 * 2) / (1024 * 1024)
+    
+    # حافظه قابل استفاده برای similarities
+    available_for_similarities_mb = target_memory_mb - mapping_memory_mb - 100  # 100 MB buffer
+    
+    if available_for_similarities_mb < 0:
+        logger.warning("Not enough memory for mappings, using minimum settings")
+        return 10
+    
+    # محاسبه تعداد کل similarities که می‌توانیم ذخیره کنیم
+    total_similarities = (available_for_similarities_mb * 1024 * 1024) / bytes_per_sparse_element
+    
+    # محاسبه max_similar_products
+    # فرض: به طور متوسط 50% از similarities بالای threshold هستند
+    # و هر محصول به طور متوسط max_similar_products محصول مشابه دارد
+    avg_similarity_ratio = 0.5  # 50% of similarities above threshold
+    
+    max_similar = int(total_similarities / (n_products * avg_similarity_ratio))
+    
+    # محدودیت‌های منطقی
+    min_similar = 10
+    max_similar = min(max_similar, n_products - 1)  # نمی‌تواند بیشتر از تعداد کل محصولات باشد
+    max_similar = max(max_similar, min_similar)
+    
+    # محدودیت عملی: برای جلوگیری از مصرف بیش از حد حافظه
+    practical_max = min(max_similar, 500)  # حداکثر 500 محصول مشابه
+    
+    logger.info(
+        f"Calculated max_similar_products: {practical_max} "
+        f"(theoretical: {max_similar}, limited to {practical_max})"
+    )
+    
+    return practical_max
+
+
 class ContentBasedFiltering:
     """سیستم توصیه مبتنی بر محتوا (بهینه‌سازی شده برای حافظه)"""
     
-    def __init__(self, use_sparse: bool = True, max_similar_products: int = 50):
+    def __init__(
+        self, 
+        use_sparse: bool = True, 
+        max_similar_products: Optional[int] = None, 
+        n_jobs: int = -1,
+        target_memory_usage_percent: float = 0.8,
+        auto_optimize_memory: bool = True
+    ):
         """
         Args:
             use_sparse: استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
-            max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول
+            max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول (None = auto-calculate)
+            n_jobs: تعداد thread/core برای پردازش موازی (-1 = همه هسته‌ها)
+            target_memory_usage_percent: درصد حافظه RAM مورد استفاده (0.8 = 80%)
+            auto_optimize_memory: محاسبه خودکار max_similar_products بر اساس حافظه
         """
         self.product_features = None
         self.product_similarities = None  # Sparse matrix یا dict
@@ -40,6 +152,12 @@ class ContentBasedFiltering:
         self.max_similar_products = max_similar_products
         self.tfidf_matrix = None
         self.vectorizer = None
+        self.n_jobs = n_jobs if n_jobs > 0 else cpu_count()
+        self.target_memory_usage_percent = target_memory_usage_percent
+        self.auto_optimize_memory = auto_optimize_memory
+        logger.info(f"Initialized ContentBasedFiltering with {self.n_jobs} CPU cores")
+        if auto_optimize_memory:
+            logger.info(f"Auto memory optimization enabled (target: {target_memory_usage_percent*100}% RAM)")
     
     def extract_product_features(self, products: List[Product]) -> Dict[int, Dict]:
         """استخراج ویژگی‌های محصولات"""
@@ -92,11 +210,25 @@ class ContentBasedFiltering:
         ساخت ماتریس شباهت محصولات (بهینه‌سازی شده)
         
         به جای ساخت ماتریس کامل N×N، فقط شباهت‌های مهم را ذخیره می‌کند
+        اگر auto_optimize_memory فعال باشد، از 80% حافظه RAM استفاده می‌کند
         """
         product_ids = list(product_features.keys())
         n_products = len(product_ids)
         
         logger.info(f"Building similarity matrix for {n_products} products...")
+        
+        # محاسبه خودکار max_similar_products بر اساس حافظه
+        if self.auto_optimize_memory and self.max_similar_products is None:
+            self.max_similar_products = calculate_optimal_max_similar_products(
+                n_products=n_products,
+                target_memory_usage_percent=self.target_memory_usage_percent
+            )
+        elif self.max_similar_products is None:
+            # Default fallback
+            self.max_similar_products = 50
+            logger.warning("max_similar_products not set, using default: 50")
+        
+        logger.info(f"Using max_similar_products: {self.max_similar_products}")
         
         # ذخیره نگاشت
         self.product_to_index = {pid: i for i, pid in enumerate(product_ids)}
@@ -132,17 +264,15 @@ class ContentBasedFiltering:
     
     def _build_sparse_similarity_matrix(self, product_features: Dict[int, Dict]) -> None:
         """
-        ساخت ماتریس شباهت Sparse (فقط شباهت‌های مهم)
+        ساخت ماتریس شباهت Sparse (فقط شباهت‌های مهم) با پردازش موازی
         
         استراتژی:
         1. محاسبه شباهت فقط برای محصولات در همان دسته‌بندی
         2. نگه‌داری فقط top-k مشابه‌ترین محصولات
         3. استفاده از Sparse Matrix
+        4. پردازش موازی دسته‌بندی‌ها
         """
         n_products = len(self.product_to_index)
-        
-        # ساختار: {product_id: [(similar_product_id, similarity), ...]}
-        similarity_dict = defaultdict(list)
         
         # گروه‌بندی محصولات بر اساس دسته‌بندی
         products_by_category = defaultdict(list)
@@ -153,19 +283,71 @@ class ContentBasedFiltering:
         
         logger.info(f"Grouped products into {len(products_by_category)} categories")
         
-        # محاسبه شباهت فقط برای محصولات در همان دسته‌بندی
-        processed = 0
-        batch_size = 1000
-        
+        # آماده‌سازی داده‌ها برای پردازش موازی
+        category_data = []
         for category_id, category_products in products_by_category.items():
             if len(category_products) < 2:
                 continue
-            
-            # محاسبه شباهت برای محصولات این دسته
             category_indices = [self.product_to_index[pid] for pid in category_products]
-            category_tfidf = self.tfidf_matrix[category_indices]
+            category_data.append((category_id, category_products, category_indices))
+        
+        # پردازش موازی دسته‌بندی‌ها
+        logger.info(f"Processing {len(category_data)} categories in parallel using {self.n_jobs} cores...")
+        
+        if self.n_jobs > 1 and len(category_data) > 1:
+            # استفاده از multiprocessing برای پردازش موازی
+            # تبدیل tfidf_matrix به array برای serialization
+            tfidf_array = self.tfidf_matrix.toarray() if hasattr(self.tfidf_matrix, 'toarray') else self.tfidf_matrix
             
-            # محاسبه شباهت (فقط برای این دسته)
+            with Pool(processes=self.n_jobs) as pool:
+                results = pool.starmap(
+                    _process_category_similarities_worker,
+                    [
+                        (
+                            cat_data,
+                            tfidf_array,
+                            self.max_similar_products
+                        )
+                        for cat_data in category_data
+                    ]
+                )
+        else:
+            # پردازش sequential
+            results = [
+                self._process_category_similarities(cat_data, product_features)
+                for cat_data in category_data
+            ]
+        
+        # ترکیب نتایج
+        similarity_dict = defaultdict(list)
+        for category_results in results:
+            for product_id, similar_products in category_results.items():
+                similarity_dict[product_id].extend(similar_products)
+        
+        # تبدیل به Sparse Matrix
+        logger.info("Converting to sparse matrix...")
+        self._similarity_dict_to_sparse(similarity_dict, product_features)
+        
+        logger.info("Similarity matrix built successfully!")
+    
+    def _process_category_similarities(
+        self,
+        category_data: Tuple[int, List[int], List[int]],
+        product_features: Dict[int, Dict]
+    ) -> Dict[int, List[Tuple[int, float]]]:
+        """
+        پردازش شباهت برای یک دسته‌بندی (برای استفاده در sequential processing)
+        
+        Returns:
+            Dict mapping product_id to list of (similar_product_id, similarity) tuples
+        """
+        category_id, category_products, category_indices = category_data
+        
+        similarity_dict = {}
+        
+        try:
+            # محاسبه شباهت برای محصولات این دسته
+            category_tfidf = self.tfidf_matrix[category_indices]
             category_similarities = cosine_similarity(category_tfidf)
             
             # ذخیره فقط top-k مشابه‌ترین
@@ -173,24 +355,26 @@ class ContentBasedFiltering:
                 similarities = category_similarities[i]
                 
                 # پیدا کردن top-k مشابه‌ترین
+                # برای استفاده بیشتر از حافظه، threshold را کاهش می‌دهیم
+                similarity_threshold = 0.05 if self.max_similar_products > 100 else 0.1
+                
                 top_indices = np.argsort(similarities)[::-1][1:self.max_similar_products + 1]
                 
+                similar_products = []
                 for j in top_indices:
-                    if similarities[j] > 0.1:  # فقط شباهت‌های معنی‌دار
+                    if similarities[j] > similarity_threshold:  # threshold قابل تنظیم
                         similar_product_id = category_products[j]
-                        similarity_dict[product_id].append(
+                        similar_products.append(
                             (similar_product_id, float(similarities[j]))
                         )
                 
-                processed += 1
-                if processed % batch_size == 0:
-                    logger.info(f"Processed {processed}/{n_products} products...")
+                if similar_products:
+                    similarity_dict[product_id] = similar_products
         
-        # تبدیل به Sparse Matrix
-        logger.info("Converting to sparse matrix...")
-        self._similarity_dict_to_sparse(similarity_dict, product_features)
+        except Exception as e:
+            logger.warning(f"Error processing category {category_id}: {e}")
         
-        logger.info("Similarity matrix built successfully!")
+        return similarity_dict
     
     def _similarity_dict_to_sparse(self, similarity_dict: Dict[int, List[Tuple[int, float]]],
                                    product_features: Dict[int, Dict]) -> None:
@@ -451,10 +635,61 @@ class ContentBasedFiltering:
         return final_recommendations
 
 
-def train_content_based_model(products: List[Product], 
-                            user_interactions: Dict[int, List[ProductInteraction]],
-                            use_sparse: bool = True,
-                            max_similar_products: int = 50) -> ContentBasedFiltering:
+def _process_category_similarities_worker(
+    category_data: Tuple[int, List[int], List[int]],
+    tfidf_array: np.ndarray,
+    max_similar_products: int
+) -> Dict[int, List[Tuple[int, float]]]:
+    """
+    Worker function برای پردازش موازی دسته‌بندی‌ها
+    
+    این تابع باید در سطح ماژول باشد تا بتواند در multiprocessing استفاده شود
+    """
+    category_id, category_products, category_indices = category_data
+    
+    similarity_dict = {}
+    
+    try:
+        # محاسبه شباهت برای محصولات این دسته
+        category_tfidf = tfidf_array[category_indices]
+        category_similarities = cosine_similarity(category_tfidf)
+        
+        # ذخیره فقط top-k مشابه‌ترین
+        for i, product_id in enumerate(category_products):
+            similarities = category_similarities[i]
+            
+            # پیدا کردن top-k مشابه‌ترین
+            # برای استفاده بیشتر از حافظه، threshold را کاهش می‌دهیم
+            similarity_threshold = 0.05 if max_similar_products > 100 else 0.1
+            
+            top_indices = np.argsort(similarities)[::-1][1:max_similar_products + 1]
+            
+            similar_products = []
+            for j in top_indices:
+                if similarities[j] > similarity_threshold:  # threshold قابل تنظیم
+                    similar_product_id = category_products[j]
+                    similar_products.append(
+                        (similar_product_id, float(similarities[j]))
+                    )
+            
+            if similar_products:
+                similarity_dict[product_id] = similar_products
+    
+    except Exception as e:
+        logger.warning(f"Error processing category {category_id}: {e}")
+    
+    return similarity_dict
+
+
+def train_content_based_model(
+    products: List[Product], 
+    user_interactions: Dict[int, List[ProductInteraction]],
+    use_sparse: bool = True,
+    max_similar_products: Optional[int] = None,
+    n_jobs: int = -1,
+    target_memory_usage_percent: float = 0.8,
+    auto_optimize_memory: bool = True
+) -> ContentBasedFiltering:
     """
     آموزش مدل content-based filtering (بهینه‌سازی شده)
     
@@ -462,7 +697,10 @@ def train_content_based_model(products: List[Product],
         products: لیست محصولات
         user_interactions: تعاملات کاربران
         use_sparse: استفاده از Sparse Matrix (پیش‌فرض: True)
-        max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول
+        max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول (None = auto-calculate)
+        n_jobs: تعداد thread/core برای پردازش موازی (-1 = همه هسته‌ها)
+        target_memory_usage_percent: درصد حافظه RAM مورد استفاده (0.8 = 80%)
+        auto_optimize_memory: محاسبه خودکار max_similar_products بر اساس حافظه
     
     Returns:
         ContentBasedFiltering model
@@ -470,7 +708,10 @@ def train_content_based_model(products: List[Product],
     logger.info("Training Content-Based Filtering model...")
     model = ContentBasedFiltering(
         use_sparse=use_sparse,
-        max_similar_products=max_similar_products
+        max_similar_products=max_similar_products,
+        n_jobs=n_jobs,
+        target_memory_usage_percent=target_memory_usage_percent,
+        auto_optimize_memory=auto_optimize_memory
     )
     
     logger.info("Extracting product features...")
