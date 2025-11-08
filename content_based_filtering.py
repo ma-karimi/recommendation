@@ -6,9 +6,11 @@ Content-Based Filtering با بهینه‌سازی حافظه
 - محاسبه شباهت فقط برای محصولات مرتبط (همان دسته‌بندی)
 - محاسبه Lazy (فقط وقتی نیاز است)
 - کاهش استفاده از حافظه از 11.9 GB به < 1 GB
+- DuckDB storage برای user profiles و product features
 """
 from __future__ import annotations
 import logging
+import gc
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -20,6 +22,7 @@ import re
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
+from model_storage import ModelStorage
 
 # تنظیم logger
 logger = logging.getLogger(__name__)
@@ -27,11 +30,13 @@ logger = logging.getLogger(__name__)
 class ContentBasedFiltering:
     """سیستم توصیه مبتنی بر محتوا (بهینه‌سازی شده برای حافظه)"""
     
-    def __init__(self, use_sparse: bool = True, max_similar_products: int = 50):
+    def __init__(self, use_sparse: bool = True, max_similar_products: int = 50, use_storage: bool = False, storage: Optional[ModelStorage] = None):
         """
         Args:
             use_sparse: استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
             max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول
+            use_storage: If True, use DuckDB storage for user profiles and product features
+            storage: ModelStorage instance (created if None and use_storage=True)
         """
         self.product_features = None
         self.product_similarities = None  # Sparse matrix یا dict
@@ -40,6 +45,12 @@ class ContentBasedFiltering:
         self.max_similar_products = max_similar_products
         self.tfidf_matrix = None
         self.vectorizer = None
+        self.use_storage = use_storage
+        self.storage = storage or (ModelStorage() if use_storage else None)
+        
+        # Mappings are always needed
+        self.product_to_index = {}
+        self.index_to_product = {}
     
     def extract_product_features(self, products: List[Product]) -> Dict[int, Dict]:
         """استخراج ویژگی‌های محصولات"""
@@ -399,6 +410,10 @@ class ContentBasedFiltering:
         
         به جای استفاده از کل ماتریس، فقط محصولات مشابه محصولات مورد علاقه را محاسبه می‌کند
         """
+        if self.use_storage:
+            return self._get_user_recommendations_from_storage(user_id, top_k)
+        
+        # Original in-memory implementation
         if user_id not in self.user_profiles:
             return []
         
@@ -449,12 +464,79 @@ class ContentBasedFiltering:
             ))
         
         return final_recommendations
+    
+    def _get_user_recommendations_from_storage(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
+        """Get recommendations using DuckDB storage (memory-efficient)"""
+        if not self.storage:
+            return []
+        
+        # Load user profile from storage
+        user_profile = self.storage.load_user_profile(user_id)
+        if not user_profile:
+            return []
+        
+        product_weights = user_profile.get('product_weights', {})
+        if not product_weights:
+            return []
+        
+        # Find similar products
+        recommendations = defaultdict(float)
+        seen_products = set(product_weights.keys())
+        
+        # Top liked products
+        top_liked_products = sorted(
+            product_weights.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:20]
+        
+        # Load product similarities matrix if not in memory
+        if self.product_similarities is None:
+            self.product_similarities = self.storage.load_product_similarities()
+            if self.product_similarities is None:
+                logger.warning("Product similarities not found in storage")
+                return []
+        
+        for liked_product_id, weight in top_liked_products:
+            if liked_product_id not in self.product_to_index:
+                continue
+            
+            # Get similar products
+            similar_products = self.get_product_similarities(
+                liked_product_id,
+                top_k=self.max_similar_products
+            )
+            
+            for similar_product_id, similarity in similar_products:
+                if similar_product_id not in seen_products:
+                    recommendations[similar_product_id] += similarity * weight
+        
+        # Sort and select top-k
+        sorted_recommendations = sorted(
+            recommendations.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]
+        
+        final_recommendations = []
+        for product_id, score in sorted_recommendations:
+            final_recommendations.append(Recommendation(
+                user_id=user_id,
+                product_id=product_id,
+                score=score,
+                reason="Content-based: مشابه محصولات قبلی شما",
+                confidence=min(score / 5.0, 1.0)
+            ))
+        
+        return final_recommendations
 
 
 def train_content_based_model(products: List[Product], 
                             user_interactions: Dict[int, List[ProductInteraction]],
                             use_sparse: bool = True,
-                            max_similar_products: int = 50) -> ContentBasedFiltering:
+                            max_similar_products: int = 50,
+                            use_storage: bool = True,
+                            save_to_storage: bool = True) -> ContentBasedFiltering:
     """
     آموزش مدل content-based filtering (بهینه‌سازی شده)
     
@@ -463,14 +545,24 @@ def train_content_based_model(products: List[Product],
         user_interactions: تعاملات کاربران
         use_sparse: استفاده از Sparse Matrix (پیش‌فرض: True)
         max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول
+        use_storage: If True, use DuckDB storage for inference (saves memory)
+        save_to_storage: If True, save trained model to DuckDB after training
     
     Returns:
         ContentBasedFiltering model
     """
     logger.info("Training Content-Based Filtering model...")
+    
+    # Create storage if needed
+    storage = None
+    if use_storage or save_to_storage:
+        storage = ModelStorage()
+    
     model = ContentBasedFiltering(
         use_sparse=use_sparse,
-        max_similar_products=max_similar_products
+        max_similar_products=max_similar_products,
+        use_storage=use_storage,
+        storage=storage
     )
     
     logger.info("Extracting product features...")
@@ -481,6 +573,32 @@ def train_content_based_model(products: List[Product],
     
     logger.info("Building user profiles...")
     model.build_user_profiles(user_interactions, product_features)
+    
+    # Save to storage if requested
+    if save_to_storage and storage:
+        logger.info("Saving model to DuckDB storage...")
+        
+        # Save product similarities sparse matrix
+        if model.product_similarities is not None:
+            similarities_path = storage.save_product_similarities(model.product_similarities)
+            logger.info(f"Product similarities saved to {similarities_path}")
+        
+        # Save user profiles and product features
+        storage.save_content_model(
+            model.user_profiles,
+            product_features,
+            similarities_path if model.product_similarities is not None else None
+        )
+        
+        # Clear from memory if using storage
+        if use_storage:
+            logger.info("Clearing large data structures from memory...")
+            model.user_profiles = None
+            model.product_features = None
+            # Keep product_similarities in memory for now (it's sparse and needed for get_product_similarities)
+            # But we can reload it from disk when needed
+            gc.collect()
+            logger.info("Memory cleared. Model will use DuckDB storage for inference.")
     
     logger.info("Content-Based Filtering model trained successfully!")
     return model

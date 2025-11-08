@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
+import gc
 import numpy as np
 from collections import defaultdict
 
@@ -7,12 +8,13 @@ from models import User, Product, ProductInteraction, Recommendation
 from collaborative_filtering import CollaborativeFiltering, train_collaborative_model
 from content_based_filtering import ContentBasedFiltering, train_content_based_model
 from object_loader import load_users, load_products, load_user_purchase_history
+from model_storage import ModelStorage
 
 
 class HybridRecommender:
     """سیستم توصیه ترکیبی (Hybrid Recommendation System)"""
     
-    def __init__(self, collaborative_weight: float = 0.6, content_weight: float = 0.4):
+    def __init__(self, collaborative_weight: float = 0.6, content_weight: float = 0.4, use_storage: bool = True):
         self.collaborative_weight = collaborative_weight
         self.content_weight = content_weight
         self.collaborative_model = None
@@ -20,6 +22,8 @@ class HybridRecommender:
         self.users = []
         self.products = []
         self.user_interactions = {}
+        self.use_storage = use_storage
+        self.storage = ModelStorage() if use_storage else None
     
     def train(self, start_date=None, end_date=None) -> None:
         """آموزش مدل‌های توصیه"""
@@ -141,6 +145,16 @@ class HybridRecommender:
         # ایجاد دیکشنری محصولات برای دسترسی سریع
         products_dict = {p.id: p for p in self.products}
         
+        # Get user purchases (from memory or storage)
+        if self.use_storage and self.storage:
+            # Load user purchases from storage if needed
+            user_purchases = set()
+            user_ratings = self.storage.load_user_item_row(user_id)
+            if user_ratings:
+                user_purchases = set(user_ratings.keys())
+        else:
+            user_purchases = {interaction.product_id for interaction in self.user_interactions.get(user_id, [])}
+        
         for rec in recommendations:
             product = products_dict.get(rec.product_id)
             if not product:
@@ -155,7 +169,6 @@ class HybridRecommender:
                 continue
             
             # فیلتر محصولات که کاربر قبلاً خریده
-            user_purchases = {interaction.product_id for interaction in self.user_interactions.get(user_id, [])}
             if rec.product_id in user_purchases:
                 continue
             

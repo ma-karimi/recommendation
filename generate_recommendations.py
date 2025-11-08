@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 import datetime as dt
+import gc
 import glob
 import logging
 import os
@@ -252,6 +253,9 @@ def generate_recommendations_for_all_users(
                             else:
                                 users_without_recommendations += 1
                         
+                        # Memory cleanup after each batch
+                        gc.collect()
+                        
                         # نمایش پیشرفت
                         processed = min(i + batch_size, total_users)
                         progress = (processed * 100) // total_users
@@ -283,6 +287,10 @@ def generate_recommendations_for_all_users(
                 users_with_recommendations += 1
             else:
                 users_without_recommendations += 1
+            
+            # Memory cleanup every 100 users
+            if idx % 100 == 0:
+                gc.collect()
     
     logger.info(
         f"Summary: {users_with_recommendations} users with recommendations, "
@@ -475,20 +483,29 @@ def main(sample_size: int = None, n_jobs: int = -1):
         from content_based_filtering import train_content_based_model
         
         print("   🔹 آموزش مدل Collaborative Filtering...")
-        # استفاده از چند هسته CPU برای آموزش
+        # استفاده از چند هسته CPU برای آموزش و DuckDB storage
         recommender.collaborative_model = train_collaborative_model(
             interactions,
-            n_jobs=n_jobs
+            n_jobs=n_jobs,
+            use_storage=True,  # Use DuckDB storage to save memory
+            save_to_storage=True  # Save trained model to DuckDB
         )
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
-        # استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
+        # استفاده از Sparse Matrix و DuckDB storage برای صرفه‌جویی در حافظه
         recommender.content_model = train_content_based_model(
             products_list, 
             user_interactions,
             use_sparse=True,  # استفاده از Sparse Matrix
-            max_similar_products=50  # حداکثر 50 محصول مشابه برای هر محصول
+            max_similar_products=50,  # حداکثر 50 محصول مشابه برای هر محصول
+            use_storage=True,  # Use DuckDB storage to save memory
+            save_to_storage=True  # Save trained model to DuckDB
         )
+        
+        # Memory cleanup after training
+        import gc
+        gc.collect()
+        print("   ✅ حافظه پاکسازی شد")
         
         print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
         

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import gc
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -10,6 +11,7 @@ from functools import partial
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
+from model_storage import ModelStorage
 
 # تنظیم logger
 logger = logging.getLogger(__name__)
@@ -18,16 +20,26 @@ logger = logging.getLogger(__name__)
 class CollaborativeFiltering:
     """سیستم توصیه مبتنی بر همکاری کاربران"""
     
-    def __init__(self, min_common_items: int = 2, n_jobs: int = 1):
+    def __init__(self, min_common_items: int = 2, n_jobs: int = 1, use_storage: bool = False, storage: Optional[ModelStorage] = None):
         """
         Args:
             min_common_items: حداقل تعداد آیتم مشترک برای محاسبه شباهت
             n_jobs: تعداد هسته CPU برای محاسبه شباهت‌ها (1 = sequential)
+            use_storage: If True, use DuckDB storage instead of in-memory matrices
+            storage: ModelStorage instance (created if None and use_storage=True)
         """
         self.min_common_items = min_common_items
         self.user_item_matrix = None
         self.user_similarities = None
         self.n_jobs = n_jobs
+        self.use_storage = use_storage
+        self.storage = storage or (ModelStorage() if use_storage else None)
+        
+        # Mappings are always needed for index conversion
+        self.user_to_index = {}
+        self.product_to_index = {}
+        self.index_to_user = {}
+        self.index_to_product = {}
     
     def build_user_item_matrix(self, interactions: List[ProductInteraction]) -> None:
         """ساخت ماتریس کاربر-محصول"""
@@ -170,6 +182,10 @@ class CollaborativeFiltering:
     
     def get_user_recommendations(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
         """دریافت توصیه‌های کاربر"""
+        if self.use_storage:
+            return self._get_user_recommendations_from_storage(user_id, top_k)
+        
+        # Original in-memory implementation
         if user_id not in self.user_to_index:
             return []
         
@@ -226,8 +242,132 @@ class CollaborativeFiltering:
         
         return recommendations
     
+    def _get_user_recommendations_from_storage(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
+        """Get recommendations using DuckDB storage (memory-efficient)"""
+        if not self.storage:
+            return []
+        
+        # Load user's item ratings from storage
+        user_ratings = self.storage.load_user_item_row(user_id)
+        if not user_ratings:
+            return []
+        
+        # Get similar users first
+        similar_users = self.storage.load_user_similarities(user_id, top_k=100)
+        if not similar_users:
+            return []
+        
+        # Create a dict for quick lookup
+        similar_user_dict = {uid: sim for uid, sim in similar_users}
+        
+        # Get products rated by similar users (more efficient than loading all products)
+        similar_user_ids = list(similar_user_dict.keys())
+        candidate_product_ids = self.storage.get_products_rated_by_users(similar_user_ids)
+        
+        # Find unseen products (only from candidates)
+        unseen_product_ids = [pid for pid in candidate_product_ids if pid not in user_ratings]
+        
+        # Predict ratings for unseen products
+        predictions = []
+        batch_size = 1000
+        
+        for i in range(0, len(unseen_product_ids), batch_size):
+            batch_products = unseen_product_ids[i:i + batch_size]
+            
+            # Load ratings for these products from similar users
+            for product_id in batch_products:
+                score, similar_users_details = self._predict_rating_from_storage(
+                    user_id, product_id, user_ratings, similar_user_dict
+                )
+                if score > 0:
+                    predictions.append((product_id, score, similar_users_details))
+            
+            # Cleanup
+            if i % (batch_size * 10) == 0:
+                gc.collect()
+        
+        # Sort and select top-k
+        predictions.sort(key=lambda x: x[1], reverse=True)
+        
+        recommendations = []
+        for product_id, score, similar_users_details in predictions[:top_k]:
+            if similar_users_details:
+                top_similar = similar_users_details[:5]
+                details_json = json.dumps({
+                    'similar_users': [
+                        {'user_id': uid, 'similarity': round(sim, 4),
+                         'similarity_percent': round(sim * 100, 2)}
+                        for uid, sim in top_similar
+                    ],
+                    'total_similar_users': len(similar_users_details)
+                }, ensure_ascii=False)
+                
+                similar_users_str = ', '.join([f"user_{uid}" for uid, _ in top_similar])
+                reason = f"Collaborative: {len(similar_users_details)} کاربران مشابه ({similar_users_str}) این محصول را خریده‌اند"
+            else:
+                details_json = None
+                reason = "Collaborative: توصیه بر اساس رفتار کاربران مشابه"
+            
+            recommendations.append(Recommendation(
+                user_id=user_id,
+                product_id=product_id,
+                score=score,
+                reason=reason,
+                confidence=min(score / 5.0, 1.0),
+                collaborative_details=details_json
+            ))
+        
+        return recommendations
+    
+    def _predict_rating_from_storage(
+        self,
+        user_id: int,
+        product_id: int,
+        user_ratings: Dict[int, float],
+        similar_user_dict: Dict[int, float]
+    ) -> Tuple[float, List[Tuple[int, float]]]:
+        """Predict rating using storage (memory-efficient)"""
+        if not self.storage:
+            return 0.0, []
+        
+        # Get ratings for this product from similar users
+        similar_users_with_rating = []
+        similar_users_details = []
+        
+        for similar_user_id, similarity in similar_user_dict.items():
+            # Load this similar user's ratings
+            similar_user_ratings = self.storage.load_user_item_row(similar_user_id)
+            if product_id in similar_user_ratings:
+                rating = similar_user_ratings[product_id]
+                similar_users_with_rating.append((similarity, rating))
+                similar_users_details.append((similar_user_id, similarity))
+        
+        if not similar_users_with_rating:
+            return 0.0, []
+        
+        # Sort by similarity
+        similar_users_details.sort(key=lambda x: x[1], reverse=True)
+        
+        # Weighted average
+        total_weight = 0.0
+        weighted_sum = 0.0
+        
+        for similarity, rating in similar_users_with_rating:
+            if similarity > 0:
+                total_weight += similarity
+                weighted_sum += similarity * rating
+        
+        if total_weight == 0:
+            return 0.0, []
+        
+        return weighted_sum / total_weight, similar_users_details
+    
     def _predict_rating(self, user_idx: int, product_idx: int) -> Tuple[float, List[Tuple[int, float]]]:
         """پیش‌بینی امتیاز محصول برای کاربر و برگرداندن جزئیات کاربران مشابه"""
+        if self.use_storage:
+            # This shouldn't be called in storage mode
+            return 0.0, []
+        
         similarities = self.user_similarities[user_idx]
         ratings = self.user_item_matrix[:, product_idx]
         
@@ -264,6 +404,11 @@ class CollaborativeFiltering:
     
     def get_similar_users(self, user_id: int, top_k: int = 5) -> List[Tuple[int, float]]:
         """دریافت کاربران مشابه"""
+        if self.use_storage:
+            if not self.storage:
+                return []
+            return self.storage.load_user_similarities(user_id, top_k)
+        
         if user_id not in self.user_to_index:
             return []
         
@@ -328,14 +473,18 @@ def _cosine_similarity_helper(user1: np.ndarray, user2: np.ndarray) -> float:
 
 def train_collaborative_model(
     interactions: List[ProductInteraction],
-    n_jobs: int = -1
+    n_jobs: int = -1,
+    use_storage: bool = True,
+    save_to_storage: bool = True
 ) -> CollaborativeFiltering:
     """
-    آموزش مدل collaborative filtering (با پشتیبانی از multiprocessing)
+    آموزش مدل collaborative filtering (با پشتیبانی از multiprocessing و DuckDB storage)
     
     Args:
         interactions: لیست تعاملات کاربر-محصول
         n_jobs: تعداد هسته CPU برای استفاده (-1 = همه هسته‌ها، 1 = sequential)
+        use_storage: If True, use DuckDB storage for inference (saves memory)
+        save_to_storage: If True, save trained model to DuckDB after training
     
     Returns:
         CollaborativeFiltering model
@@ -352,13 +501,38 @@ def train_collaborative_model(
 
     logger.info(f"Using {n_jobs} CPU core(s) for training...")
     
-    model = CollaborativeFiltering(n_jobs=n_jobs)
+    # Create storage if needed
+    storage = None
+    if use_storage or save_to_storage:
+        storage = ModelStorage()
+    
+    model = CollaborativeFiltering(n_jobs=n_jobs, use_storage=use_storage, storage=storage)
     
     logger.info("Building user-item matrix...")
     model.build_user_item_matrix(interactions)
     
     logger.info("Calculating user similarities...")
     model.calculate_user_similarities()
+    
+    # Save to storage if requested
+    if save_to_storage and storage:
+        logger.info("Saving model to DuckDB storage...")
+        storage.save_collaborative_model(
+            model.user_item_matrix,
+            model.user_similarities,
+            model.user_to_index,
+            model.product_to_index,
+            model.index_to_user,
+            model.index_to_product
+        )
+        
+        # Clear large matrices from memory if using storage
+        if use_storage:
+            logger.info("Clearing large matrices from memory...")
+            model.user_item_matrix = None
+            model.user_similarities = None
+            gc.collect()
+            logger.info("Memory cleared. Model will use DuckDB storage for inference.")
     
     logger.info("Collaborative Filtering model trained successfully!")
     return model
