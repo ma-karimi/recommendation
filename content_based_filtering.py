@@ -22,17 +22,18 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
 
+from models import User, Product, ProductInteraction, Recommendation
+from object_loader import load_user_purchase_history
+
+# تنظیم logger (باید قبل از استفاده در try-except تعریف شود)
+logger = logging.getLogger(__name__)
+
+# Import psutil (optional dependency)
 try:
     import psutil
 except ImportError:
     psutil = None
     logger.warning("psutil not installed. Install with: pip install psutil")
-
-from models import User, Product, ProductInteraction, Recommendation
-from object_loader import load_user_purchase_history
-
-# تنظیم logger
-logger = logging.getLogger(__name__)
 
 
 def get_available_memory_mb() -> float:
