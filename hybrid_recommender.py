@@ -168,17 +168,32 @@ class HybridRecommender:
     
     def get_similar_products(self, product_id: int, top_k: int = 5) -> List[Tuple[int, float]]:
         """دریافت محصولات مشابه"""
-        if not self.content_model or product_id not in self.content_model.product_to_index:
+        if not self.content_model:
+            return []
+        
+        # استفاده از متد بهینه‌سازی شده
+        if hasattr(self.content_model, 'get_product_similarities'):
+            return self.content_model.get_product_similarities(product_id, top_k)
+        
+        # Fallback برای حالت قدیمی
+        if product_id not in self.content_model.product_to_index:
             return []
         
         product_idx = self.content_model.product_to_index[product_id]
-        similarities = self.content_model.product_similarities[product_idx]
+        
+        # بررسی نوع ماتریس
+        if hasattr(self.content_model.product_similarities, 'toarray'):
+            # Sparse Matrix
+            similarities = self.content_model.product_similarities[product_idx].toarray()[0]
+        else:
+            # Dense Matrix
+            similarities = self.content_model.product_similarities[product_idx]
         
         similar_products = []
         for similar_idx, similarity in enumerate(similarities):
-            if similar_idx != product_idx and similarity > 0:
+            if similar_idx != product_idx and similarity > 0.1:
                 similar_product_id = self.content_model.index_to_product[similar_idx]
-                similar_products.append((similar_product_id, similarity))
+                similar_products.append((similar_product_id, float(similarity)))
         
         similar_products.sort(key=lambda x: x[1], reverse=True)
         return similar_products[:top_k]

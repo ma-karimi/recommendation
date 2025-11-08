@@ -387,7 +387,13 @@ def main(sample_size: int = None):
         recommender.collaborative_model = train_collaborative_model(interactions)
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
-        recommender.content_model = train_content_based_model(products_list, user_interactions)
+        # استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
+        recommender.content_model = train_content_based_model(
+            products_list, 
+            user_interactions,
+            use_sparse=True,  # استفاده از Sparse Matrix
+            max_similar_products=50  # حداکثر 50 محصول مشابه برای هر محصول
+        )
         
         print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
         
