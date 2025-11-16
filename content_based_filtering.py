@@ -1,56 +1,45 @@
-"""
-Content-Based Filtering با بهینه‌سازی حافظه
-
-بهینه‌سازی‌ها:
-- استفاده از Sparse Matrix برای ذخیره شباهت‌ها
-- محاسبه شباهت فقط برای محصولات مرتبط (همان دسته‌بندی)
-- محاسبه Lazy (فقط وقتی نیاز است)
-- کاهش استفاده از حافظه از 11.9 GB به < 1 GB
-- DuckDB storage برای user profiles و product features
-"""
 from __future__ import annotations
-import logging
-import gc
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import math
-from scipy.sparse import csr_matrix, save_npz, load_npz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix
 import re
+import logging
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
-from model_storage import ModelStorage
 
-# تنظیم logger
 logger = logging.getLogger(__name__)
 
+# Try to import joblib for parallel processing
+try:
+    from joblib import Parallel, delayed
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+    logger.warning("joblib not available, parallel processing disabled")
+
+
 class ContentBasedFiltering:
-    """سیستم توصیه مبتنی بر محتوا (بهینه‌سازی شده برای حافظه)"""
+    """سیستم توصیه مبتنی بر محتوا - بهینه‌شده برای حافظه و CPU"""
     
-    def __init__(self, use_sparse: bool = True, max_similar_products: int = 50, use_storage: bool = False, storage: Optional[ModelStorage] = None):
+    def __init__(self, use_sparse: bool = True, n_jobs: int = -1):
         """
         Args:
-            use_sparse: استفاده از Sparse Matrix برای صرفه‌جویی در حافظه
-            max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول
-            use_storage: If True, use DuckDB storage for user profiles and product features
-            storage: ModelStorage instance (created if None and use_storage=True)
+            use_sparse: استفاده از ماتریس‌های sparse برای صرفه‌جویی در حافظه
+            n_jobs: تعداد هسته‌های CPU برای پردازش موازی (-1 = همه هسته‌ها)
         """
         self.product_features = None
-        self.product_similarities = None  # Sparse matrix یا dict
+        self.product_similarities = None  # فقط برای محصولات محبوب (cache)
+        self.tfidf_matrix = None  # ماتریس TF-IDF sparse
+        self.vectorizer = None
         self.user_profiles = None
         self.use_sparse = use_sparse
-        self.max_similar_products = max_similar_products
-        self.tfidf_matrix = None
-        self.vectorizer = None
-        self.use_storage = use_storage
-        self.storage = storage or (ModelStorage() if use_storage else None)
-        
-        # Mappings are always needed
-        self.product_to_index = {}
-        self.index_to_product = {}
+        self.n_jobs = n_jobs if HAS_JOBLIB else 1
+        self._similarity_cache = {}  # Cache برای شباهت‌های محاسبه شده
     
     def extract_product_features(self, products: List[Product]) -> Dict[int, Dict]:
         """استخراج ویژگی‌های محصولات"""
@@ -100,216 +89,155 @@ class ContentBasedFiltering:
     
     def build_product_similarity_matrix(self, product_features: Dict[int, Dict]) -> None:
         """
-        ساخت ماتریس شباهت محصولات (بهینه‌سازی شده)
-        
-        به جای ساخت ماتریس کامل N×N، فقط شباهت‌های مهم را ذخیره می‌کند
+        ساخت ماتریس شباهت محصولات - بهینه‌شده برای حافظه
+        به جای ساخت ماتریس کامل، فقط TF-IDF را ذخیره می‌کند و شباهت‌ها را on-demand محاسبه می‌کند
         """
         product_ids = list(product_features.keys())
         n_products = len(product_ids)
         
-        logger.info(f"Building similarity matrix for {n_products} products...")
+        logger.info(f"Building product similarity matrix for {n_products} products (memory-optimized mode)")
+        
+        # استخراج متن برای TF-IDF
+        texts = [product_features[pid]['text'] for pid in product_ids]
+        
+        # محاسبه TF-IDF با استفاده از float32 برای صرفه‌جویی در حافظه
+        self.vectorizer = TfidfVectorizer(
+            max_features=1000,
+            stop_words=None,  # برای فارسی
+            ngram_range=(1, 2),
+            dtype=np.float32  # استفاده از float32 به جای float64
+        )
+        self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        
+        # تبدیل به float32 برای صرفه‌جویی در حافظه
+        if hasattr(self.tfidf_matrix, 'astype'):
+            self.tfidf_matrix = self.tfidf_matrix.astype(np.float32)
         
         # ذخیره نگاشت
         self.product_to_index = {pid: i for i, pid in enumerate(product_ids)}
         self.index_to_product = {i: pid for pid, i in self.product_to_index.items()}
         
-        # استخراج متن برای TF-IDF
-        texts = [product_features[pid]['text'] for pid in product_ids]
+        # ذخیره product_features برای محاسبه شباهت‌های عددی
+        self.product_features = product_features
         
-        # محاسبه TF-IDF
-        logger.info("Computing TF-IDF vectors...")
-        self.vectorizer = TfidfVectorizer(
-            max_features=500,  # کاهش از 1000 به 500
-            stop_words=None,
-            ngram_range=(1, 2),
-            min_df=2,  # فقط کلمات که در حداقل 2 سند آمده
-            max_df=0.95  # حذف کلمات خیلی رایج
-        )
-        self.tfidf_matrix = self.vectorizer.fit_transform(texts)
-        logger.info(f"TF-IDF matrix shape: {self.tfidf_matrix.shape}")
+        logger.info(f"TF-IDF matrix created: shape={self.tfidf_matrix.shape}, "
+                   f"memory={self.tfidf_matrix.nbytes / 1024 / 1024:.2f} MB")
         
-        # بهینه‌سازی: محاسبه شباهت فقط برای محصولات مرتبط
-        if self.use_sparse:
-            logger.info("Building sparse similarity matrix (memory efficient)...")
-            self._build_sparse_similarity_matrix(product_features)
+        # دیگر نیازی به ساخت ماتریس کامل نیست - شباهت‌ها on-demand محاسبه می‌شوند
+        self.product_similarities = None
+    
+    def _compute_similarity(self, product1_id: int, product2_id: int) -> float:
+        """
+        محاسبه شباهت بین دو محصول - on-demand
+        ترکیب شباهت متنی (TF-IDF) و شباهت عددی
+        """
+        if product1_id not in self.product_to_index or product2_id not in self.product_to_index:
+            return 0.0
+        
+        # استفاده از cache اگر وجود داشته باشد
+        cache_key = tuple(sorted([product1_id, product2_id]))
+        if cache_key in self._similarity_cache:
+            return self._similarity_cache[cache_key]
+        
+        idx1 = self.product_to_index[product1_id]
+        idx2 = self.product_to_index[product2_id]
+        
+        # محاسبه شباهت متنی (TF-IDF cosine similarity)
+        if self.tfidf_matrix is not None:
+            # محاسبه cosine similarity بین دو بردار sparse
+            vec1 = self.tfidf_matrix[idx1:idx1+1]
+            vec2 = self.tfidf_matrix[idx2:idx2+1]
+            text_similarity = float(cosine_similarity(vec1, vec2)[0, 0])
         else:
-            logger.warning("Using dense matrix - may require large memory!")
-            # فقط برای تعداد کم محصولات
-            if n_products > 10000:
-                raise MemoryError(
-                    f"Too many products ({n_products}). Use sparse mode or reduce products."
-                )
-            self.product_similarities = cosine_similarity(self.tfidf_matrix)
+            text_similarity = 0.0
+        
+        # محاسبه شباهت عددی
+        if self.product_features:
+            features1 = self.product_features.get(product1_id, {})
+            features2 = self.product_features.get(product2_id, {})
+            
+            # شباهت قیمت
+            price_sim = self._price_similarity(
+                features1.get('price', 0),
+                features2.get('price', 0)
+            )
+            
+            # شباهت دسته‌بندی
+            category_sim = 1.0 if features1.get('category_id') == features2.get('category_id') else 0.0
+            
+            # شباهت فروشنده
+            seller_sim = 1.0 if features1.get('seller_id') == features2.get('seller_id') else 0.0
+            
+            # ترکیب شباهت‌های عددی
+            numerical_sim = (price_sim * 0.4 + category_sim * 0.4 + seller_sim * 0.2)
+            
+            # ترکیب با شباهت متنی
+            combined_similarity = text_similarity * 0.7 + numerical_sim * 0.3
+        else:
+            combined_similarity = text_similarity
+        
+        # ذخیره در cache (محدود کردن اندازه cache)
+        if len(self._similarity_cache) < 100000:  # حداکثر 100k entry در cache
+            self._similarity_cache[cache_key] = combined_similarity
+        
+        return combined_similarity
     
-    def _build_sparse_similarity_matrix(self, product_features: Dict[int, Dict]) -> None:
+    def _get_similar_products(self, product_id: int, top_k: int = 100) -> List[Tuple[int, float]]:
         """
-        ساخت ماتریس شباهت Sparse (فقط شباهت‌های مهم)
-        
-        استراتژی:
-        1. محاسبه شباهت فقط برای محصولات در همان دسته‌بندی
-        2. نگه‌داری فقط top-k مشابه‌ترین محصولات
-        3. استفاده از Sparse Matrix
+        پیدا کردن محصولات مشابه به یک محصول - بهینه‌شده با استفاده از batch computation
         """
-        n_products = len(self.product_to_index)
-        
-        # ساختار: {product_id: [(similar_product_id, similarity), ...]}
-        similarity_dict = defaultdict(list)
-        
-        # گروه‌بندی محصولات بر اساس دسته‌بندی
-        products_by_category = defaultdict(list)
-        for product_id, features in product_features.items():
-            category_id = features.get('category_id')
-            if category_id:
-                products_by_category[category_id].append(product_id)
-        
-        logger.info(f"Grouped products into {len(products_by_category)} categories")
-        
-        # محاسبه شباهت فقط برای محصولات در همان دسته‌بندی
-        processed = 0
-        batch_size = 1000
-        
-        for category_id, category_products in products_by_category.items():
-            if len(category_products) < 2:
-                continue
-            
-            # محاسبه شباهت برای محصولات این دسته
-            category_indices = [self.product_to_index[pid] for pid in category_products]
-            category_tfidf = self.tfidf_matrix[category_indices]
-            
-            # محاسبه شباهت (فقط برای این دسته)
-            category_similarities = cosine_similarity(category_tfidf)
-            
-            # ذخیره فقط top-k مشابه‌ترین
-            for i, product_id in enumerate(category_products):
-                similarities = category_similarities[i]
-                
-                # پیدا کردن top-k مشابه‌ترین
-                top_indices = np.argsort(similarities)[::-1][1:self.max_similar_products + 1]
-                
-                for j in top_indices:
-                    if similarities[j] > 0.1:  # فقط شباهت‌های معنی‌دار
-                        similar_product_id = category_products[j]
-                        similarity_dict[product_id].append(
-                            (similar_product_id, float(similarities[j]))
-                        )
-                
-                processed += 1
-                if processed % batch_size == 0:
-                    logger.info(f"Processed {processed}/{n_products} products...")
-        
-        # تبدیل به Sparse Matrix
-        logger.info("Converting to sparse matrix...")
-        self._similarity_dict_to_sparse(similarity_dict, product_features)
-        
-        logger.info("Similarity matrix built successfully!")
-    
-    def _similarity_dict_to_sparse(self, similarity_dict: Dict[int, List[Tuple[int, float]]],
-                                   product_features: Dict[int, Dict]) -> None:
-        """تبدیل dict شباهت به Sparse Matrix"""
-        n_products = len(self.product_to_index)
-        
-        # ساخت Sparse Matrix
-        rows = []
-        cols = []
-        data = []
-        
-        for product_id, similar_products in similarity_dict.items():
-            if product_id not in self.product_to_index:
-                continue
-            
-            row_idx = self.product_to_index[product_id]
-            
-            for similar_product_id, similarity in similar_products:
-                if similar_product_id not in self.product_to_index:
-                    continue
-                
-                col_idx = self.product_to_index[similar_product_id]
-                
-                # اضافه کردن شباهت عددی
-                numerical_sim = self._compute_numerical_similarity(
-                    product_features[product_id],
-                    product_features[similar_product_id]
-                )
-                
-                # ترکیب شباهت متنی و عددی
-                combined_sim = similarity * 0.7 + numerical_sim * 0.3
-                
-                rows.append(row_idx)
-                cols.append(col_idx)
-                data.append(combined_sim)
-        
-        # ساخت Sparse Matrix
-        self.product_similarities = csr_matrix(
-            (data, (rows, cols)),
-            shape=(n_products, n_products)
-        )
-        
-        logger.info(
-            f"Sparse matrix created: {len(data)} non-zero elements "
-            f"({len(data) / (n_products * n_products) * 100:.2f}% density)"
-        )
-    
-    def _compute_numerical_similarity(self, features1: Dict, features2: Dict) -> float:
-        """محاسبه شباهت بر اساس ویژگی‌های عددی"""
-        # شباهت قیمت
-        price_sim = self._price_similarity(features1['price'], features2['price'])
-        
-        # شباهت دسته‌بندی
-        category_sim = 1.0 if features1.get('category_id') == features2.get('category_id') else 0.0
-        
-        # شباهت فروشنده
-        seller_sim = 1.0 if features1.get('seller_id') == features2.get('seller_id') else 0.0
-        
-        # ترکیب
-        return price_sim * 0.4 + category_sim * 0.4 + seller_sim * 0.2
-    
-    def get_product_similarities(self, product_id: int, top_k: int = 50) -> List[Tuple[int, float]]:
-        """
-        دریافت محصولات مشابه برای یک محصول (بهینه‌سازی شده)
-        
-        این روش حافظه کمتری استفاده می‌کند چون فقط شباهت‌های مورد نیاز را محاسبه می‌کند
-        """
-        if product_id not in self.product_to_index:
+        if product_id not in self.product_to_index or self.tfidf_matrix is None:
             return []
         
         product_idx = self.product_to_index[product_id]
         
-        if isinstance(self.product_similarities, csr_matrix):
-            # استفاده از Sparse Matrix (کارآمدتر)
-            row = self.product_similarities[product_idx]
+        # استفاده از batch cosine similarity برای محاسبه سریع‌تر
+        # محاسبه شباهت بین محصول فعلی و همه محصولات دیگر به صورت batch
+        product_vector = self.tfidf_matrix[product_idx:product_idx+1]
+        
+        # محاسبه cosine similarity با همه محصولات به صورت batch
+        # این بسیار سریع‌تر از محاسبه تک‌تک است
+        all_similarities = cosine_similarity(product_vector, self.tfidf_matrix)[0]
+        
+        # تبدیل به لیست (product_id, similarity)
+        similarities = []
+        for idx, sim in enumerate(all_similarities):
+            if idx == product_idx:  # خود محصول را نادیده بگیر
+                continue
             
-            # دریافت فقط عناصر غیر صفر
-            if row.nnz == 0:
-                return []
+            other_product_id = self.index_to_product[idx]
             
-            # تبدیل به array فقط برای عناصر غیر صفر
-            col_indices = row.indices
-            similarities = row.data
+            # اضافه کردن شباهت عددی
+            if self.product_features:
+                features1 = self.product_features.get(product_id, {})
+                features2 = self.product_features.get(other_product_id, {})
+                
+                # شباهت قیمت
+                price_sim = self._price_similarity(
+                    features1.get('price', 0),
+                    features2.get('price', 0)
+                )
+                
+                # شباهت دسته‌بندی
+                category_sim = 1.0 if features1.get('category_id') == features2.get('category_id') else 0.0
+                
+                # شباهت فروشنده
+                seller_sim = 1.0 if features1.get('seller_id') == features2.get('seller_id') else 0.0
+                
+                # ترکیب شباهت‌های عددی
+                numerical_sim = (price_sim * 0.4 + category_sim * 0.4 + seller_sim * 0.2)
+                
+                # ترکیب با شباهت متنی
+                combined_sim = float(sim) * 0.7 + numerical_sim * 0.3
+            else:
+                combined_sim = float(sim)
             
-            # مرتب‌سازی بر اساس شباهت
-            sorted_indices = np.argsort(similarities)[::-1]
-            
-            similar_products = []
-            for idx in sorted_indices[:top_k]:
-                if similarities[idx] > 0.1:  # فقط شباهت‌های معنی‌دار
-                    similar_product_id = self.index_to_product[col_indices[idx]]
-                    similar_products.append((similar_product_id, float(similarities[idx])))
-            
-            return similar_products
-        else:
-            # Dense Matrix (فقط برای تعداد کم محصولات)
-            similarities = self.product_similarities[product_idx]
-            
-            # پیدا کردن top-k مشابه‌ترین
-            top_indices = np.argsort(similarities)[::-1][1:top_k + 1]
-            
-            similar_products = []
-            for idx in top_indices:
-                if similarities[idx] > 0.1:
-                    similar_product_id = self.index_to_product[idx]
-                    similar_products.append((similar_product_id, float(similarities[idx])))
-            
-            return similar_products
+            if combined_sim > 0:
+                similarities.append((other_product_id, combined_sim))
+        
+        # مرتب‌سازی و برگرداندن top_k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
     
     def _price_similarity(self, price1: float, price2: float) -> float:
         """محاسبه شباهت قیمت"""
@@ -406,114 +334,68 @@ class ContentBasedFiltering:
     
     def get_user_recommendations(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
         """
-        دریافت توصیه‌های کاربر (بهینه‌سازی شده)
-        
-        به جای استفاده از کل ماتریس، فقط محصولات مشابه محصولات مورد علاقه را محاسبه می‌کند
+        دریافت توصیه‌های کاربر - بهینه‌شده با پردازش موازی
         """
-        if self.use_storage:
-            return self._get_user_recommendations_from_storage(user_id, top_k)
-        
-        # Original in-memory implementation
         if user_id not in self.user_profiles:
             return []
         
         user_profile = self.user_profiles[user_id]
         product_weights = user_profile['product_weights']
         
-        # پیدا کردن محصولات مشابه به محصولات مورد علاقه
-        recommendations = defaultdict(float)
-        seen_products = set(product_weights.keys())
-        
-        # محدود کردن به top محصولات مورد علاقه برای سرعت بیشتر
-        top_liked_products = sorted(
-            product_weights.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:20]  # فقط 20 محصول برتر
-        
-        for liked_product_id, weight in top_liked_products:
-            if liked_product_id not in self.product_to_index:
-                continue
-            
-            # دریافت محصولات مشابه (Lazy)
-            similar_products = self.get_product_similarities(
-                liked_product_id,
-                top_k=self.max_similar_products
-            )
-            
-            for similar_product_id, similarity in similar_products:
-                if similar_product_id not in seen_products:
-                    # تجمیع امتیاز
-                    recommendations[similar_product_id] += similarity * weight
-        
-        # مرتب‌سازی و انتخاب بهترین‌ها
-        sorted_recommendations = sorted(
-            recommendations.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:top_k]
-        
-        final_recommendations = []
-        for product_id, score in sorted_recommendations:
-            final_recommendations.append(Recommendation(
-                user_id=user_id,
-                product_id=product_id,
-                score=score,
-                reason="Content-based: مشابه محصولات قبلی شما",
-                confidence=min(score / 5.0, 1.0)  # نرمال‌سازی
-            ))
-        
-        return final_recommendations
-    
-    def _get_user_recommendations_from_storage(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
-        """Get recommendations using DuckDB storage (memory-efficient)"""
-        if not self.storage:
-            return []
-        
-        # Load user profile from storage
-        user_profile = self.storage.load_user_profile(user_id)
-        if not user_profile:
-            return []
-        
-        product_weights = user_profile.get('product_weights', {})
         if not product_weights:
             return []
         
-        # Find similar products
-        recommendations = defaultdict(float)
+        # پیدا کردن محصولات مشابه به محصولات مورد علاقه
+        recommendations_dict = defaultdict(float)
         seen_products = set(product_weights.keys())
         
-        # Top liked products
-        top_liked_products = sorted(
-            product_weights.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:20]
+        # محدود کردن تعداد محصولات برای محاسبه شباهت (برای سرعت بیشتر)
+        max_products_to_check = min(50, len(product_weights))  # فقط 50 محصول اول
         
-        # Load product similarities matrix if not in memory
-        if self.product_similarities is None:
-            self.product_similarities = self.storage.load_product_similarities()
-            if self.product_similarities is None:
-                logger.warning("Product similarities not found in storage")
-                return []
+        liked_products = list(product_weights.items())[:max_products_to_check]
         
-        for liked_product_id, weight in top_liked_products:
-            if liked_product_id not in self.product_to_index:
-                continue
+        # پردازش موازی برای پیدا کردن محصولات مشابه
+        if HAS_JOBLIB and self.n_jobs != 1 and len(liked_products) > 5:
+            def process_liked_product(item):
+                liked_product_id, weight = item
+                if liked_product_id not in self.product_to_index:
+                    return []
+                
+                # پیدا کردن محصولات مشابه (top 20 برای هر محصول)
+                similar_products = self._get_similar_products(liked_product_id, top_k=20)
+                
+                results = []
+                for similar_product_id, similarity in similar_products:
+                    if similar_product_id not in seen_products:
+                        score = similarity * weight
+                        results.append((similar_product_id, score))
+                return results
             
-            # Get similar products
-            similar_products = self.get_product_similarities(
-                liked_product_id,
-                top_k=self.max_similar_products
+            all_results = Parallel(n_jobs=self.n_jobs, backend='threading')(
+                delayed(process_liked_product)(item) for item in liked_products
             )
             
-            for similar_product_id, similarity in similar_products:
-                if similar_product_id not in seen_products:
-                    recommendations[similar_product_id] += similarity * weight
+            # ترکیب نتایج
+            for results in all_results:
+                for product_id, score in results:
+                    recommendations_dict[product_id] += score
+        else:
+            # پردازش سریالی
+            for liked_product_id, weight in liked_products:
+                if liked_product_id not in self.product_to_index:
+                    continue
+                
+                # پیدا کردن محصولات مشابه
+                similar_products = self._get_similar_products(liked_product_id, top_k=20)
+                
+                for similar_product_id, similarity in similar_products:
+                    if similar_product_id not in seen_products:
+                        score = similarity * weight
+                        recommendations_dict[similar_product_id] += score
         
-        # Sort and select top-k
+        # مرتب‌سازی و انتخاب بهترین‌ها
         sorted_recommendations = sorted(
-            recommendations.items(),
+            recommendations_dict.items(),
             key=lambda x: x[1],
             reverse=True
         )[:top_k]
@@ -523,9 +405,9 @@ class ContentBasedFiltering:
             final_recommendations.append(Recommendation(
                 user_id=user_id,
                 product_id=product_id,
-                score=score,
-                reason="Content-based: مشابه محصولات قبلی شما",
-                confidence=min(score / 5.0, 1.0)
+                score=float(score),
+                reason="توصیه بر اساس محصولات مشابه",
+                confidence=min(float(score), 1.0)
             ))
         
         return final_recommendations
@@ -533,74 +415,19 @@ class ContentBasedFiltering:
 
 def train_content_based_model(products: List[Product], 
                             user_interactions: Dict[int, List[ProductInteraction]],
-                            use_sparse: bool = True,
-                            max_similar_products: int = 50,
-                            use_storage: bool = True,
-                            save_to_storage: bool = True) -> ContentBasedFiltering:
+                            n_jobs: int = -1) -> ContentBasedFiltering:
     """
-    آموزش مدل content-based filtering (بهینه‌سازی شده)
+    آموزش مدل content-based filtering
     
     Args:
         products: لیست محصولات
-        user_interactions: تعاملات کاربران
-        use_sparse: استفاده از Sparse Matrix (پیش‌فرض: True)
-        max_similar_products: حداکثر تعداد محصولات مشابه برای هر محصول
-        use_storage: If True, use DuckDB storage for inference (saves memory)
-        save_to_storage: If True, save trained model to DuckDB after training
-    
-    Returns:
-        ContentBasedFiltering model
+        user_interactions: دیکشنری تعاملات کاربران
+        n_jobs: تعداد هسته‌های CPU برای پردازش موازی (-1 = همه هسته‌ها)
     """
-    logger.info("Training Content-Based Filtering model...")
-    
-    # Create storage if needed
-    storage = None
-    if use_storage or save_to_storage:
-        storage = ModelStorage()
-    
-    model = ContentBasedFiltering(
-        use_sparse=use_sparse,
-        max_similar_products=max_similar_products,
-        use_storage=use_storage,
-        storage=storage
-    )
-    
-    logger.info("Extracting product features...")
+    model = ContentBasedFiltering(n_jobs=n_jobs)
     product_features = model.extract_product_features(products)
-    
-    logger.info("Building product similarity matrix...")
     model.build_product_similarity_matrix(product_features)
-    
-    logger.info("Building user profiles...")
     model.build_user_profiles(user_interactions, product_features)
-    
-    # Save to storage if requested
-    if save_to_storage and storage:
-        logger.info("Saving model to DuckDB storage...")
-        
-        # Save product similarities sparse matrix
-        if model.product_similarities is not None:
-            similarities_path = storage.save_product_similarities(model.product_similarities)
-            logger.info(f"Product similarities saved to {similarities_path}")
-        
-        # Save user profiles and product features
-        storage.save_content_model(
-            model.user_profiles,
-            product_features,
-            similarities_path if model.product_similarities is not None else None
-        )
-        
-        # Clear from memory if using storage
-        if use_storage:
-            logger.info("Clearing large data structures from memory...")
-            model.user_profiles = None
-            model.product_features = None
-            # Keep product_similarities in memory for now (it's sparse and needed for get_product_similarities)
-            # But we can reload it from disk when needed
-            gc.collect()
-            logger.info("Memory cleared. Model will use DuckDB storage for inference.")
-    
-    logger.info("Content-Based Filtering model trained successfully!")
     return model
 
 
