@@ -413,7 +413,14 @@ def main(sample_size: int = None):
         from content_based_filtering import train_content_based_model
         
         print("   🔹 آموزش مدل Collaborative Filtering...")
-        recommender.collaborative_model = train_collaborative_model(interactions)
+        # استفاده از DuckDB برای مدیریت حافظه
+        recommender.collaborative_model = train_collaborative_model(
+            interactions,
+            n_jobs=-1,  # استفاده از همه هسته‌ها
+            use_storage=True,  # استفاده از DuckDB
+            save_to_storage=True,  # ذخیره در DuckDB
+            batch_size=10000  # پردازش در batch های 10k
+        )
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
         # استفاده از همه هسته‌های CPU برای آموزش
