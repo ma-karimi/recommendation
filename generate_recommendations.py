@@ -22,6 +22,13 @@ import numpy as np
 import polars as pl
 from sqlalchemy import text
 
+# Try to import joblib for parallel processing
+try:
+    from joblib import Parallel, delayed
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
 from dataframe_loader import get_engine, load_order_items
 from hybrid_recommender import HybridRecommender
 from models import Product, ProductInteraction, User
@@ -134,16 +141,18 @@ def generate_recommendations_for_all_users(
     recommender: HybridRecommender,
     users_df: pl.DataFrame,
     top_k: int = 20,
-    sample_size: int = None
+    sample_size: int = None,
+    n_jobs: int = -1
 ) -> pl.DataFrame:
     """
-    تولید توصیه برای کاربران
+    تولید توصیه برای کاربران - با پشتیبانی از پردازش موازی
     
     Args:
         recommender: مدل توصیه‌گر
         users_df: DataFrame کاربران
         top_k: تعداد توصیه برای هر کاربر
         sample_size: تعداد کاربران برای تست (None = همه کاربران)
+        n_jobs: تعداد هسته‌های CPU برای پردازش موازی (-1 = همه هسته‌ها)
     """
     
     # محدود کردن به sample اگر مشخص شده
@@ -151,32 +160,26 @@ def generate_recommendations_for_all_users(
         users_df = users_df.head(sample_size)
         logger.warning(f"Test mode: Only processing first {sample_size} users")
     
-    recommendations_data = []
+    # تبدیل به لیست برای پردازش
+    users_list = list(users_df.iter_rows(named=True))
+    total_users = len(users_list)
     
-    logger.info(f"Starting recommendation generation for {len(users_df)} users...")
+    logger.info(f"Starting recommendation generation for {total_users} users...")
+    if HAS_JOBLIB and n_jobs != 1:
+        logger.info(f"Using parallel processing with {n_jobs if n_jobs > 0 else 'all'} CPU cores")
     
-    # شمارنده برای نمایش پیشرفت
-    total_users = len(users_df)
-    users_with_recommendations = 0
-    users_without_recommendations = 0
-    
-    for idx, row in enumerate(users_df.iter_rows(named=True), 1):
+    def process_user(row_data):
+        """پردازش یک کاربر و برگرداندن توصیه‌ها"""
+        idx, row = row_data
         user_id = row['id']
         
-        # نمایش پیشرفت
-        if idx % 100 == 0 or idx == total_users:
-            logger.info(f"Processing user {idx}/{total_users} (User ID: {user_id})...")
-        
         try:
-            # دریافت توصیه‌ها
             recommendations = recommender.get_recommendations(user_id, top_k)
             
             if recommendations:
-                users_with_recommendations += 1
-                
-                # اضافه کردن توصیه‌ها به لیست
+                user_recs = []
                 for rank, rec in enumerate(recommendations, 1):
-                    recommendations_data.append({
+                    user_recs.append({
                         'user_id': user_id,
                         'product_id': rec.product_id,
                         'score': rec.score,
@@ -186,13 +189,39 @@ def generate_recommendations_for_all_users(
                         'collaborative_details': rec.collaborative_details,
                         'generated_at': dt.datetime.now()
                     })
+                return (True, user_recs)
             else:
-                users_without_recommendations += 1
-                
+                return (False, [])
         except Exception as e:
-            users_without_recommendations += 1
             if idx <= 10:  # فقط 10 خطای اول را نمایش می‌دهیم
                 logger.warning(f"Error for user {user_id}: {e}")
+            return (False, [])
+    
+    # پردازش موازی یا سریالی
+    if HAS_JOBLIB and n_jobs != 1 and total_users > 100:
+        # پردازش موازی
+        results = Parallel(n_jobs=n_jobs, backend='threading', verbose=1)(
+            delayed(process_user)((idx, row)) for idx, row in enumerate(users_list, 1)
+        )
+    else:
+        # پردازش سریالی
+        results = []
+        for idx, row in enumerate(users_list, 1):
+            if idx % 100 == 0 or idx == total_users:
+                logger.info(f"Processing user {idx}/{total_users} (User ID: {row['id']})...")
+            results.append(process_user((idx, row)))
+    
+    # جمع‌آوری نتایج
+    recommendations_data = []
+    users_with_recommendations = 0
+    users_without_recommendations = 0
+    
+    for has_recs, user_recs in results:
+        if has_recs:
+            users_with_recommendations += 1
+            recommendations_data.extend(user_recs)
+        else:
+            users_without_recommendations += 1
     
     logger.info(
         f"Summary: {users_with_recommendations} users with recommendations, "
@@ -387,7 +416,12 @@ def main(sample_size: int = None):
         recommender.collaborative_model = train_collaborative_model(interactions)
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
-        recommender.content_model = train_content_based_model(products_list, user_interactions)
+        # استفاده از همه هسته‌های CPU برای آموزش
+        recommender.content_model = train_content_based_model(
+            products_list, 
+            user_interactions,
+            n_jobs=-1  # استفاده از همه هسته‌ها
+        )
         
         print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
         
@@ -407,7 +441,8 @@ def main(sample_size: int = None):
         recommender,
         users_df,
         top_k=20,  # 20 توصیه برای هر کاربر
-        sample_size=sample_size
+        sample_size=sample_size,
+        n_jobs=-1  # استفاده از همه هسته‌های CPU
     )
     
     if recommendations_df.is_empty():
