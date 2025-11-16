@@ -438,6 +438,13 @@ class ModelStorage:
                 )
             # If already datetime or None, keep as is
         
+        # Aggregate duplicates: group by (user_id, product_id, interaction_type, timestamp) and sum scores/values
+        # This prevents PRIMARY KEY violations
+        df = df.group_by(['user_id', 'product_id', 'interaction_type', 'timestamp']).agg([
+            pl.col('score').sum().alias('score'),
+            pl.col('value').sum().alias('value')
+        ])
+        
         # Register as temporary table
         self.conn.register('temp_interactions', df)
         
