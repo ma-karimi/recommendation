@@ -426,14 +426,17 @@ class ModelStorage:
         # Convert timestamp column to proper datetime type if it exists
         if 'timestamp' in df.columns:
             # Handle None/null values and convert strings to datetime
-            df = df.with_columns(
-                pl.when(pl.col('timestamp').is_null())
-                .then(None)
-                .otherwise(
-                    pl.col('timestamp').str.to_datetime()
+            # First check if column is string type, then convert
+            if df['timestamp'].dtype == pl.Utf8 or df['timestamp'].dtype == pl.String:
+                df = df.with_columns(
+                    pl.when(pl.col('timestamp').is_null() | (pl.col('timestamp') == ''))
+                    .then(None)
+                    .otherwise(
+                        pl.col('timestamp').str.to_datetime()
+                    )
+                    .alias('timestamp')
                 )
-                .alias('timestamp')
-            )
+            # If already datetime or None, keep as is
         
         # Register as temporary table
         self.conn.register('temp_interactions', df)
