@@ -420,18 +420,35 @@ class ModelStorage:
         if not interactions_data:
             return
         
-        # Convert to DataFrame and insert
+        # Convert to DataFrame with proper timestamp handling
         df = pl.DataFrame(interactions_data)
+        
+        # Convert timestamp column to proper datetime type if it exists
+        if 'timestamp' in df.columns:
+            # Handle None/null values and convert strings to datetime
+            df = df.with_columns(
+                pl.when(pl.col('timestamp').is_null())
+                .then(None)
+                .otherwise(
+                    pl.col('timestamp').str.to_datetime()
+                )
+                .alias('timestamp')
+            )
+        
         # Register as temporary table
         self.conn.register('temp_interactions', df)
-        # Insert (DuckDB will handle duplicates based on PRIMARY KEY)
-        # First delete existing rows, then insert new ones
+        
+        # Delete existing rows with matching keys (excluding timestamp from WHERE clause to avoid type mismatch)
+        # Since timestamp is part of PRIMARY KEY, we delete all matching user_id, product_id, interaction_type
+        # and then insert new ones
         self.conn.execute("""
             DELETE FROM training_interactions 
-            WHERE (user_id, product_id, interaction_type, timestamp) IN (
-                SELECT user_id, product_id, interaction_type, timestamp FROM temp_interactions
+            WHERE (user_id, product_id, interaction_type) IN (
+                SELECT DISTINCT user_id, product_id, interaction_type FROM temp_interactions
             )
         """)
+        
+        # Insert new data
         self.conn.execute("INSERT INTO training_interactions SELECT * FROM temp_interactions")
         self.conn.unregister('temp_interactions')
         self.conn.commit()
