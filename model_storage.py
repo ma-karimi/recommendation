@@ -445,6 +445,17 @@ class ModelStorage:
             pl.col('value').sum().alias('value')
         ])
         
+        # Ensure correct column order matching the table schema:
+        # user_id, product_id, interaction_type, score, timestamp, value
+        df = df.select([
+            'user_id',
+            'product_id',
+            'interaction_type',
+            'score',
+            'timestamp',
+            'value'
+        ])
+        
         # Register as temporary table
         self.conn.register('temp_interactions', df)
         
@@ -458,8 +469,12 @@ class ModelStorage:
             )
         """)
         
-        # Insert new data
-        self.conn.execute("INSERT INTO training_interactions SELECT * FROM temp_interactions")
+        # Insert new data with explicit column order to match table schema
+        self.conn.execute("""
+            INSERT INTO training_interactions (user_id, product_id, interaction_type, score, timestamp, value)
+            SELECT user_id, product_id, interaction_type, score, timestamp, value
+            FROM temp_interactions
+        """)
         self.conn.unregister('temp_interactions')
         self.conn.commit()
     
