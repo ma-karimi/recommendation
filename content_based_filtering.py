@@ -2,44 +2,39 @@ from __future__ import annotations
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
-import math
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.sparse import csr_matrix
-import re
+import os
 import logging
+from sklearn.feature_extraction.text import TfidfVectorizer
+import faiss
+import pickle
 
 from models import User, Product, ProductInteraction, Recommendation
-from object_loader import load_user_purchase_history
+from model_storage import ModelStorage
+from settings import load_config
 
 logger = logging.getLogger(__name__)
 
-# Try to import joblib for parallel processing
-try:
-    from joblib import Parallel, delayed
-    HAS_JOBLIB = True
-except ImportError:
-    HAS_JOBLIB = False
-    logger.warning("joblib not available, parallel processing disabled")
-
 
 class ContentBasedFiltering:
-    """سیستم توصیه مبتنی بر محتوا - بهینه‌شده برای حافظه و CPU"""
+    """سیستم توصیه مبتنی بر محتوا با استفاده از ANN (Approximate Nearest Neighbor)"""
     
-    def __init__(self, use_sparse: bool = True, n_jobs: int = -1):
+    def __init__(self, storage: Optional[ModelStorage] = None):
         """
         Args:
-            use_sparse: استفاده از ماتریس‌های sparse برای صرفه‌جویی در حافظه
-            n_jobs: تعداد هسته‌های CPU برای پردازش موازی (-1 = همه هسته‌ها)
+            storage: ModelStorage instance for DuckDB operations. If None, creates a new one.
         """
-        self.product_features = None
-        self.product_similarities = None  # فقط برای محصولات محبوب (cache)
-        self.tfidf_matrix = None  # ماتریس TF-IDF sparse
+        self.storage = storage or ModelStorage()
         self.vectorizer = None
+        self.ann_index = None
+        self.product_to_index = {}
+        self.index_to_product = {}
+        self.vector_dim = None
+        self.index_path = None
         self.user_profiles = None
-        self.use_sparse = use_sparse
-        self.n_jobs = n_jobs if HAS_JOBLIB else 1
-        self._similarity_cache = {}  # Cache برای شباهت‌های محاسبه شده
+        
+        # Load config for index path
+        cfg = load_config()
+        self.index_path = os.path.join(cfg.output_dir, "product_ann_index.bin")
     
     def extract_product_features(self, products: List[Product]) -> Dict[int, Dict]:
         """استخراج ویژگی‌های محصولات"""
@@ -87,165 +82,377 @@ class ContentBasedFiltering:
         else:
             return "high_stock"
     
-    def build_product_similarity_matrix(self, product_features: Dict[int, Dict]) -> None:
+    def _compute_tfidf_vectors(self, product_features: Dict[int, Dict]) -> Tuple[np.ndarray, Dict[int, int]]:
         """
-        ساخت ماتریس شباهت محصولات - بهینه‌شده برای حافظه
-        به جای ساخت ماتریس کامل، فقط TF-IDF را ذخیره می‌کند و شباهت‌ها را on-demand محاسبه می‌کند
+        محاسبه بردارهای TF-IDF برای محصولات
+        
+        Returns:
+            vectors: numpy array of shape (n_products, vector_dim)
+            product_to_index: mapping from product_id to row index in vectors
         """
         product_ids = list(product_features.keys())
         n_products = len(product_ids)
         
-        logger.info(f"Building product similarity matrix for {n_products} products (memory-optimized mode)")
-        
         # استخراج متن برای TF-IDF
         texts = [product_features[pid]['text'] for pid in product_ids]
         
-        # محاسبه TF-IDF با استفاده از float32 برای صرفه‌جویی در حافظه
+        # محاسبه TF-IDF
+        logger.info(f"Computing TF-IDF vectors for {n_products} products...")
         self.vectorizer = TfidfVectorizer(
             max_features=1000,
             stop_words=None,  # برای فارسی
-            ngram_range=(1, 2),
-            dtype=np.float32  # استفاده از float32 به جای float64
+            ngram_range=(1, 2)
         )
-        self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        tfidf_matrix = self.vectorizer.fit_transform(texts)
         
-        # تبدیل به float32 برای صرفه‌جویی در حافظه
-        if hasattr(self.tfidf_matrix, 'astype'):
-            self.tfidf_matrix = self.tfidf_matrix.astype(np.float32)
+        # تبدیل به numpy array (dense)
+        # این فقط برای ساخت index است و بعد از آن حذف می‌شود
+        vectors = tfidf_matrix.toarray().astype('float32')
+        vector_dim = vectors.shape[1]
         
-        # ذخیره نگاشت
-        self.product_to_index = {pid: i for i, pid in enumerate(product_ids)}
-        self.index_to_product = {i: pid for pid, i in self.product_to_index.items()}
+        # ایجاد نگاشت
+        product_to_index = {pid: i for i, pid in enumerate(product_ids)}
         
-        # ذخیره product_features برای محاسبه شباهت‌های عددی
-        self.product_features = product_features
-        
-        logger.info(f"TF-IDF matrix created: shape={self.tfidf_matrix.shape}, "
-                   f"memory={self.tfidf_matrix.nbytes / 1024 / 1024:.2f} MB")
-        
-        # دیگر نیازی به ساخت ماتریس کامل نیست - شباهت‌ها on-demand محاسبه می‌شوند
-        self.product_similarities = None
+        logger.info(f"TF-IDF vectors computed: shape {vectors.shape}, dimension {vector_dim}")
+        return vectors, product_to_index, vector_dim
     
-    def _compute_similarity(self, product1_id: int, product2_id: int) -> float:
+    def _store_vectors_in_duckdb(self, vectors: np.ndarray, product_to_index: Dict[int, int]) -> None:
         """
-        محاسبه شباهت بین دو محصول - on-demand
-        ترکیب شباهت متنی (TF-IDF) و شباهت عددی
+        ذخیره بردارهای TF-IDF در DuckDB به صورت batch
         """
-        if product1_id not in self.product_to_index or product2_id not in self.product_to_index:
-            return 0.0
+        logger.info("Storing TF-IDF vectors in DuckDB...")
         
-        # استفاده از cache اگر وجود داشته باشد
-        cache_key = tuple(sorted([product1_id, product2_id]))
-        if cache_key in self._similarity_cache:
-            return self._similarity_cache[cache_key]
-        
-        idx1 = self.product_to_index[product1_id]
-        idx2 = self.product_to_index[product2_id]
-        
-        # محاسبه شباهت متنی (TF-IDF cosine similarity)
-        if self.tfidf_matrix is not None:
-            # محاسبه cosine similarity بین دو بردار sparse
-            vec1 = self.tfidf_matrix[idx1:idx1+1]
-            vec2 = self.tfidf_matrix[idx2:idx2+1]
-            text_similarity = float(cosine_similarity(vec1, vec2)[0, 0])
-        else:
-            text_similarity = 0.0
-        
-        # محاسبه شباهت عددی
-        if self.product_features:
-            features1 = self.product_features.get(product1_id, {})
-            features2 = self.product_features.get(product2_id, {})
-            
-            # شباهت قیمت
-            price_sim = self._price_similarity(
-                features1.get('price', 0),
-                features2.get('price', 0)
+        # Ensure table exists
+        self.storage.conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_tfidf_vectors (
+                product_id INTEGER PRIMARY KEY,
+                vector_index INTEGER,
+                vector_data BLOB  -- Pickled numpy array
             )
-            
-            # شباهت دسته‌بندی
-            category_sim = 1.0 if features1.get('category_id') == features2.get('category_id') else 0.0
-            
-            # شباهت فروشنده
-            seller_sim = 1.0 if features1.get('seller_id') == features2.get('seller_id') else 0.0
-            
-            # ترکیب شباهت‌های عددی
-            numerical_sim = (price_sim * 0.4 + category_sim * 0.4 + seller_sim * 0.2)
-            
-            # ترکیب با شباهت متنی
-            combined_similarity = text_similarity * 0.7 + numerical_sim * 0.3
-        else:
-            combined_similarity = text_similarity
+        """)
         
-        # ذخیره در cache (محدود کردن اندازه cache)
-        if len(self._similarity_cache) < 100000:  # حداکثر 100k entry در cache
-            self._similarity_cache[cache_key] = combined_similarity
+        # Clear existing data
+        self.storage.conn.execute("DELETE FROM product_tfidf_vectors")
         
-        return combined_similarity
+        # Store vectors in batches
+        batch_size = 1000
+        n_products = len(product_to_index)
+        index_to_product = {idx: pid for pid, idx in product_to_index.items()}
+        
+        for i in range(0, n_products, batch_size):
+            batch_data = []
+            end_idx = min(i + batch_size, n_products)
+            
+            for vec_idx in range(i, end_idx):
+                product_id = index_to_product[vec_idx]
+                vector = vectors[vec_idx]
+                # Store as pickle for efficient serialization
+                vector_blob = pickle.dumps(vector)
+                batch_data.append({
+                    'product_id': product_id,
+                    'vector_index': vec_idx,
+                    'vector_data': vector_blob
+                })
+            
+            if batch_data:
+                import polars as pl
+                df = pl.DataFrame(batch_data)
+                self.storage.conn.execute("INSERT INTO product_tfidf_vectors SELECT * FROM df")
+            
+            if (i // batch_size) % 10 == 0:
+                logger.info(f"Stored {end_idx}/{n_products} vectors...")
+        
+        self.storage.conn.commit()
+        logger.info("All TF-IDF vectors stored in DuckDB")
     
-    def _get_similar_products(self, product_id: int, top_k: int = 100) -> List[Tuple[int, float]]:
+    def _load_vectors_from_duckdb_batch(self, batch_size: int = 1000) -> Tuple[np.ndarray, List[int]]:
         """
-        پیدا کردن محصولات مشابه به یک محصول - بهینه‌شده با استفاده از batch computation
+        بارگذاری بردارها از DuckDB به صورت batch
+        
+        Returns:
+            vectors: numpy array of shape (batch_size, vector_dim)
+            product_ids: list of product IDs corresponding to rows
         """
-        if product_id not in self.product_to_index or self.tfidf_matrix is None:
+        result = self.storage.conn.execute(f"""
+            SELECT product_id, vector_index, vector_data
+            FROM product_tfidf_vectors
+            ORDER BY vector_index
+            LIMIT {batch_size}
+            OFFSET ?
+        """, [0]).fetchall()
+        
+        if not result:
+            return None, []
+        
+        vectors_list = []
+        product_ids = []
+        
+        for row in result:
+            product_id, vec_idx, vector_blob = row
+            vector = pickle.loads(vector_blob)
+            vectors_list.append(vector)
+            product_ids.append(product_id)
+        
+        vectors = np.array(vectors_list, dtype='float32')
+        return vectors, product_ids
+    
+    def _build_ann_index_incremental(self, vector_dim: int, n_products: int) -> None:
+        """
+        ساخت ANN index به صورت incremental با استفاده از تمام CPU cores
+        """
+        logger.info(f"Building ANN index incrementally for {n_products} products (dim={vector_dim})...")
+        
+        # استفاده از IndexFlatIP (Inner Product) برای cosine similarity
+        # بعداً normalize می‌کنیم تا cosine similarity شود
+        self.ann_index = faiss.IndexFlatIP(vector_dim)
+        
+        # Enable threading for Faiss operations
+        faiss.omp_set_num_threads(os.cpu_count() or 4)
+        logger.info(f"Using {os.cpu_count() or 4} CPU cores for index building")
+        
+        # Load all vectors in batches and add to index
+        batch_size = 5000  # Process in batches to manage memory
+        total_loaded = 0
+        
+        # First, get total count
+        count_result = self.storage.conn.execute("SELECT COUNT(*) FROM product_tfidf_vectors").fetchone()
+        total_vectors = count_result[0] if count_result else 0
+        
+        offset = 0
+        while offset < total_vectors:
+            # Load batch
+            result = self.storage.conn.execute("""
+                SELECT product_id, vector_index, vector_data
+                FROM product_tfidf_vectors
+                ORDER BY vector_index
+                LIMIT ? OFFSET ?
+            """, [batch_size, offset]).fetchall()
+            
+            if not result:
+                break
+            
+            # Deserialize vectors
+            vectors_list = []
+            product_ids_batch = []
+            
+            for row in result:
+                product_id, vec_idx, vector_blob = row
+                vector = pickle.loads(vector_blob)
+                vectors_list.append(vector)
+                product_ids_batch.append(product_id)
+            
+            if not vectors_list:
+                break
+            
+            # Convert to numpy array
+            vectors_batch = np.array(vectors_list, dtype='float32')
+            
+            # Normalize vectors for cosine similarity (L2 normalization)
+            faiss.normalize_L2(vectors_batch)
+            
+            # Add to index
+            self.ann_index.add(vectors_batch)
+            
+            # Update mappings
+            for i, product_id in enumerate(product_ids_batch):
+                actual_index = total_loaded + i
+                self.product_to_index[product_id] = actual_index
+                self.index_to_product[actual_index] = product_id
+            
+            total_loaded += len(vectors_batch)
+            offset += batch_size
+            
+            if total_loaded % 10000 == 0 or total_loaded == total_vectors:
+                logger.info(f"Indexed {total_loaded}/{total_vectors} vectors...")
+        
+        logger.info(f"ANN index built successfully with {self.ann_index.ntotal} vectors")
+    
+    def build_product_similarity_index(self, product_features: Dict[int, Dict], force_rebuild: bool = False) -> None:
+        """
+        ساخت ANN index برای محصولات (جایگزین similarity matrix)
+        این تابع بردارهای TF-IDF را محاسبه می‌کند، در DuckDB ذخیره می‌کند،
+        و سپس ANN index را به صورت incremental می‌سازد.
+        
+        Args:
+            product_features: Dictionary of product features
+            force_rebuild: If True, rebuild index even if it exists on disk
+        """
+        # Check if index already exists and can be loaded
+        if not force_rebuild and self._load_index_from_disk():
+            logger.info("Loaded existing ANN index from disk")
+            return
+        
+        logger.info("Building product similarity index using ANN...")
+        
+        # 1. محاسبه بردارهای TF-IDF
+        vectors, product_to_index, vector_dim = self._compute_tfidf_vectors(product_features)
+        self.vector_dim = vector_dim
+        self.product_to_index = product_to_index
+        self.index_to_product = {idx: pid for pid, idx in product_to_index.items()}
+        
+        # 2. ذخیره بردارها در DuckDB
+        self._store_vectors_in_duckdb(vectors, product_to_index)
+        
+        # 3. پاک کردن vectors از RAM
+        del vectors
+        import gc
+        gc.collect()
+        
+        # 4. ساخت ANN index به صورت incremental
+        n_products = len(product_to_index)
+        self._build_ann_index_incremental(vector_dim, n_products)
+        
+        # 5. ذخیره index روی disk
+        self._save_index_to_disk()
+        
+        logger.info("Product similarity index built and saved successfully")
+    
+    def _save_index_to_disk(self) -> None:
+        """ذخیره ANN index روی disk"""
+        if self.ann_index is None:
+            return
+        
+        os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+        faiss.write_index(self.ann_index, self.index_path)
+        
+        # Save mappings and metadata
+        metadata = {
+            'product_to_index': self.product_to_index,
+            'index_to_product': self.index_to_product,
+            'vector_dim': self.vector_dim
+        }
+        
+        metadata_path = self.index_path.replace('.bin', '_metadata.pkl')
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(metadata, f)
+        
+        # Save vectorizer
+        if self.vectorizer is not None:
+            vectorizer_path = self.index_path.replace('.bin', '_vectorizer.pkl')
+            with open(vectorizer_path, 'wb') as f:
+                pickle.dump(self.vectorizer, f)
+        
+        # Store index path in DuckDB metadata
+        self.storage.conn.execute("""
+            INSERT OR REPLACE INTO model_metadata (key, value)
+            VALUES ('product_ann_index_path', ?)
+        """, [self.index_path])
+        self.storage.conn.commit()
+        
+        logger.info(f"ANN index saved to {self.index_path}")
+    
+    def _load_index_from_disk(self) -> bool:
+        """بارگذاری ANN index از disk"""
+        # Check if index exists
+        if not os.path.exists(self.index_path):
+            # Try loading path from metadata
+            result = self.storage.conn.execute("""
+                SELECT value FROM model_metadata WHERE key = 'product_ann_index_path'
+            """).fetchone()
+            
+            if result:
+                self.index_path = result[0]
+            
+            if not os.path.exists(self.index_path):
+                return False
+        
+        # Load index
+        self.ann_index = faiss.read_index(self.index_path)
+        
+        # Load metadata
+        metadata_path = self.index_path.replace('.bin', '_metadata.pkl')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'rb') as f:
+                metadata = pickle.load(f)
+                self.product_to_index = metadata['product_to_index']
+                self.index_to_product = metadata['index_to_product']
+                self.vector_dim = metadata['vector_dim']
+        
+        # Load vectorizer
+        vectorizer_path = self.index_path.replace('.bin', '_vectorizer.pkl')
+        if os.path.exists(vectorizer_path):
+            with open(vectorizer_path, 'rb') as f:
+                self.vectorizer = pickle.load(f)
+        
+        logger.info(f"ANN index loaded from {self.index_path}")
+        return True
+    
+    def get_similar_products(self, product_id: int, k: int = 20) -> List[Tuple[int, float]]:
+        """
+        دریافت محصولات مشابه برای یک محصول با استفاده از ANN index
+        
+        Args:
+            product_id: شناسه محصول
+            k: تعداد محصولات مشابه مورد نیاز
+        
+        Returns:
+            List of (product_id, similarity_score) tuples
+        """
+        if self.ann_index is None:
+            # Try to load from disk
+            if not self._load_index_from_disk():
+                logger.error("ANN index not found. Please train the model first.")
+                return []
+        
+        if product_id not in self.product_to_index:
+            logger.warning(f"Product {product_id} not found in index")
             return []
         
-        product_idx = self.product_to_index[product_id]
+        # Get product vector from DuckDB
+        result = self.storage.conn.execute("""
+            SELECT vector_data FROM product_tfidf_vectors WHERE product_id = ?
+        """, [product_id]).fetchone()
         
-        # استفاده از batch cosine similarity برای محاسبه سریع‌تر
-        # محاسبه شباهت بین محصول فعلی و همه محصولات دیگر به صورت batch
-        product_vector = self.tfidf_matrix[product_idx:product_idx+1]
+        if not result:
+            logger.warning(f"Vector not found for product {product_id}")
+            return []
         
-        # محاسبه cosine similarity با همه محصولات به صورت batch
-        # این بسیار سریع‌تر از محاسبه تک‌تک است
-        all_similarities = cosine_similarity(product_vector, self.tfidf_matrix)[0]
+        # Deserialize vector
+        vector = pickle.loads(result[0])
+        query_vector = vector.reshape(1, -1).astype('float32')
         
-        # تبدیل به لیست (product_id, similarity)
-        similarities = []
-        for idx, sim in enumerate(all_similarities):
-            if idx == product_idx:  # خود محصول را نادیده بگیر
+        # Normalize for cosine similarity
+        faiss.normalize_L2(query_vector)
+        
+        # Search in ANN index
+        # k+1 because the product itself will be in results
+        distances, indices = self.ann_index.search(query_vector, k + 1)
+        
+        # Convert indices to product IDs and filter out the query product itself
+        similar_products = []
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx < len(self.index_to_product):
+                similar_product_id = self.index_to_product[idx]
+                if similar_product_id != product_id:  # Exclude self
+                    # dist is already cosine similarity (inner product after normalization)
+                    similarity = float(dist)
+                    similar_products.append((similar_product_id, similarity))
+        
+        return similar_products[:k]
+    
+    def _add_numerical_similarities(self, product_features: Dict[int, Dict], 
+                                   similar_products: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+        """
+        اضافه کردن شباهت بر اساس ویژگی‌های عددی به نتایج ANN
+        این تابع نتایج ANN را با در نظر گیری ویژگی‌های عددی تنظیم می‌کند.
+        """
+        if not similar_products:
+            return similar_products
+        
+        # Get query product features (assume it's passed via context)
+        # For now, we'll adjust scores based on numerical features
+        adjusted_products = []
+        
+        for product_id, ann_score in similar_products:
+            if product_id not in product_features:
+                adjusted_products.append((product_id, ann_score))
                 continue
             
-            other_product_id = self.index_to_product[idx]
-            
-            # اضافه کردن شباهت عددی
-            if self.product_features:
-                features1 = self.product_features.get(product_id, {})
-                features2 = self.product_features.get(other_product_id, {})
-                
-                # شباهت قیمت
-                price_sim = self._price_similarity(
-                    features1.get('price', 0),
-                    features2.get('price', 0)
-                )
-                
-                # شباهت دسته‌بندی
-                category_sim = 1.0 if features1.get('category_id') == features2.get('category_id') else 0.0
-                
-                # شباهت فروشنده
-                seller_sim = 1.0 if features1.get('seller_id') == features2.get('seller_id') else 0.0
-                
-                # ترکیب شباهت‌های عددی
-                numerical_sim = (price_sim * 0.4 + category_sim * 0.4 + seller_sim * 0.2)
-                
-                # ترکیب با شباهت متنی
-                combined_sim = float(sim) * 0.7 + numerical_sim * 0.3
-            else:
-                combined_sim = float(sim)
-            
-            if combined_sim > 0:
-                similarities.append((other_product_id, combined_sim))
+            # Numerical similarity boost (simplified - in practice, you'd compare with query product)
+            # This is a placeholder - in real implementation, you'd need the query product_id
+            adjusted_products.append((product_id, ann_score))
         
-        # مرتب‌سازی و برگرداندن top_k
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
-    
-    def _price_similarity(self, price1: float, price2: float) -> float:
-        """محاسبه شباهت قیمت"""
-        if price1 == 0 or price2 == 0:
-            return 0.0
-        
-        ratio = min(price1, price2) / max(price1, price2)
-        return ratio
+        return adjusted_products
     
     def build_user_profiles(self, user_interactions: Dict[int, List[ProductInteraction]], 
                           product_features: Dict[int, Dict]) -> None:
@@ -333,70 +540,34 @@ class ContentBasedFiltering:
         return dict(seller_weights)
     
     def get_user_recommendations(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
-        """
-        دریافت توصیه‌های کاربر - بهینه‌شده با پردازش موازی
-        """
+        """دریافت توصیه‌های کاربر"""
         if user_id not in self.user_profiles:
             return []
         
         user_profile = self.user_profiles[user_id]
         product_weights = user_profile['product_weights']
         
-        if not product_weights:
-            return []
-        
-        # پیدا کردن محصولات مشابه به محصولات مورد علاقه
-        recommendations_dict = defaultdict(float)
+        # پیدا کردن محصولات مشابه به محصولات مورد علاقه با استفاده از ANN
+        recommendations = []
         seen_products = set(product_weights.keys())
         
-        # محدود کردن تعداد محصولات برای محاسبه شباهت (برای سرعت بیشتر)
-        max_products_to_check = min(50, len(product_weights))  # فقط 50 محصول اول
+        # Collect similar products from all liked products
+        all_similar = defaultdict(float)
         
-        liked_products = list(product_weights.items())[:max_products_to_check]
-        
-        # پردازش موازی برای پیدا کردن محصولات مشابه
-        if HAS_JOBLIB and self.n_jobs != 1 and len(liked_products) > 5:
-            def process_liked_product(item):
-                liked_product_id, weight = item
-                if liked_product_id not in self.product_to_index:
-                    return []
-                
-                # پیدا کردن محصولات مشابه (top 20 برای هر محصول)
-                similar_products = self._get_similar_products(liked_product_id, top_k=20)
-                
-                results = []
-                for similar_product_id, similarity in similar_products:
-                    if similar_product_id not in seen_products:
-                        score = similarity * weight
-                        results.append((similar_product_id, score))
-                return results
+        for liked_product_id, weight in product_weights.items():
+            # Get similar products using ANN
+            similar_products = self.get_similar_products(liked_product_id, k=50)
             
-            all_results = Parallel(n_jobs=self.n_jobs, backend='threading')(
-                delayed(process_liked_product)(item) for item in liked_products
-            )
-            
-            # ترکیب نتایج
-            for results in all_results:
-                for product_id, score in results:
-                    recommendations_dict[product_id] += score
-        else:
-            # پردازش سریالی
-            for liked_product_id, weight in liked_products:
-                if liked_product_id not in self.product_to_index:
-                    continue
-                
-                # پیدا کردن محصولات مشابه
-                similar_products = self._get_similar_products(liked_product_id, top_k=20)
-                
-                for similar_product_id, similarity in similar_products:
-                    if similar_product_id not in seen_products:
-                        score = similarity * weight
-                        recommendations_dict[similar_product_id] += score
+            for similar_product_id, similarity in similar_products:
+                if similar_product_id not in seen_products:
+                    # Combine similarity with user's preference weight
+                    score = similarity * weight
+                    all_similar[similar_product_id] = max(all_similar[similar_product_id], score)
         
-        # مرتب‌سازی و انتخاب بهترین‌ها
+        # Sort by score and take top_k
         sorted_recommendations = sorted(
-            recommendations_dict.items(),
-            key=lambda x: x[1],
+            all_similar.items(), 
+            key=lambda x: x[1], 
             reverse=True
         )[:top_k]
         
@@ -405,9 +576,9 @@ class ContentBasedFiltering:
             final_recommendations.append(Recommendation(
                 user_id=user_id,
                 product_id=product_id,
-                score=float(score),
-                reason="توصیه بر اساس محصولات مشابه",
-                confidence=min(float(score), 1.0)
+                score=score,
+                reason="توصیه بر اساس محصولات مشابه (ANN)",
+                confidence=min(score, 1.0)
             ))
         
         return final_recommendations
@@ -415,19 +586,22 @@ class ContentBasedFiltering:
 
 def train_content_based_model(products: List[Product], 
                             user_interactions: Dict[int, List[ProductInteraction]],
-                            n_jobs: int = -1) -> ContentBasedFiltering:
+                            storage: Optional[ModelStorage] = None) -> ContentBasedFiltering:
     """
-    آموزش مدل content-based filtering
+    آموزش مدل content-based filtering با استفاده از ANN
     
     Args:
         products: لیست محصولات
-        user_interactions: دیکشنری تعاملات کاربران
-        n_jobs: تعداد هسته‌های CPU برای پردازش موازی (-1 = همه هسته‌ها)
+        user_interactions: تعاملات کاربران
+        storage: ModelStorage instance (optional)
     """
-    model = ContentBasedFiltering(n_jobs=n_jobs)
+    model = ContentBasedFiltering(storage=storage)
     product_features = model.extract_product_features(products)
-    model.build_product_similarity_matrix(product_features)
+    
+    # Build ANN index instead of full similarity matrix
+    model.build_product_similarity_index(product_features)
+    
+    # Build user profiles
     model.build_user_profiles(user_interactions, product_features)
+    
     return model
-
-

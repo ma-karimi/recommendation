@@ -97,36 +97,21 @@ class ModelStorage:
             )
         """)
         
+        # Create table for TF-IDF vectors (used by ANN-based content filtering)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_tfidf_vectors (
+                product_id INTEGER PRIMARY KEY,
+                vector_index INTEGER,
+                vector_data BLOB  -- Pickled numpy array
+            )
+        """)
+        
         # Store sparse matrix metadata
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS model_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
-        """)
-        
-        # Create table for storing raw interactions during training
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS training_interactions (
-                user_id INTEGER,
-                product_id INTEGER,
-                interaction_type TEXT,
-                score REAL,
-                timestamp TIMESTAMP,
-                value REAL,
-                PRIMARY KEY (user_id, product_id, interaction_type, timestamp)
-            )
-        """)
-        
-        # Create index for faster queries
-        self.conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_interactions_user 
-            ON training_interactions(user_id)
-        """)
-        
-        self.conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_interactions_product 
-            ON training_interactions(product_id)
         """)
         
         logger.info(f"Model storage initialized at {self.db_path}")
@@ -410,245 +395,6 @@ class ModelStorage:
             return load_npz(path)
         return None
     
-    def save_interactions_batch(self, interactions_data: List[Dict]) -> None:
-        """
-        Save interactions to DuckDB in batches for memory-efficient processing
-        
-        Args:
-            interactions_data: List of dicts with keys: user_id, product_id, interaction_type, score, timestamp, value
-        """
-        if not interactions_data:
-            return
-        
-        # Convert to DataFrame with proper timestamp handling
-        df = pl.DataFrame(interactions_data)
-        
-        # Convert timestamp column to proper datetime type if it exists
-        if 'timestamp' in df.columns:
-            # Handle None/null values and convert strings to datetime
-            # First check if column is string type, then convert
-            if df['timestamp'].dtype == pl.Utf8 or df['timestamp'].dtype == pl.String:
-                df = df.with_columns(
-                    pl.when(pl.col('timestamp').is_null() | (pl.col('timestamp') == ''))
-                    .then(None)
-                    .otherwise(
-                        pl.col('timestamp').str.to_datetime()
-                    )
-                    .alias('timestamp')
-                )
-            # If already datetime or None, keep as is
-        
-        # Aggregate duplicates: group by (user_id, product_id, interaction_type, timestamp) and sum scores/values
-        # This prevents PRIMARY KEY violations
-        df = df.group_by(['user_id', 'product_id', 'interaction_type', 'timestamp']).agg([
-            pl.col('score').sum().alias('score'),
-            pl.col('value').sum().alias('value')
-        ])
-        
-        # Ensure correct column order matching the table schema:
-        # user_id, product_id, interaction_type, score, timestamp, value
-        df = df.select([
-            'user_id',
-            'product_id',
-            'interaction_type',
-            'score',
-            'timestamp',
-            'value'
-        ])
-        
-        # Register as temporary table
-        self.conn.register('temp_interactions', df)
-        
-        # Delete existing rows with matching keys (excluding timestamp from WHERE clause to avoid type mismatch)
-        # Since timestamp is part of PRIMARY KEY, we delete all matching user_id, product_id, interaction_type
-        # and then insert new ones
-        self.conn.execute("""
-            DELETE FROM training_interactions 
-            WHERE (user_id, product_id, interaction_type) IN (
-                SELECT DISTINCT user_id, product_id, interaction_type FROM temp_interactions
-            )
-        """)
-        
-        # Insert new data with explicit column order to match table schema
-        self.conn.execute("""
-            INSERT INTO training_interactions (user_id, product_id, interaction_type, score, timestamp, value)
-            SELECT user_id, product_id, interaction_type, score, timestamp, value
-            FROM temp_interactions
-        """)
-        self.conn.unregister('temp_interactions')
-        self.conn.commit()
-    
-    def get_interactions_batch(self, batch_size: int = 10000, offset: int = 0) -> List[Dict]:
-        """Load interactions in batches from DuckDB"""
-        result = self.conn.execute(f"""
-            SELECT user_id, product_id, interaction_type, score, timestamp, value
-            FROM training_interactions
-            ORDER BY user_id, product_id
-            LIMIT ? OFFSET ?
-        """, [batch_size, offset]).fetchall()
-        
-        return [
-            {
-                'user_id': row[0],
-                'product_id': row[1],
-                'interaction_type': row[2],
-                'score': row[3],
-                'timestamp': row[4],
-                'value': row[5]
-            }
-            for row in result
-        ]
-    
-    def get_interactions_count(self) -> int:
-        """Get total number of interactions stored"""
-        result = self.conn.execute("SELECT COUNT(*) FROM training_interactions").fetchone()
-        return result[0] if result else 0
-    
-    def clear_interactions(self) -> None:
-        """Clear all training interactions"""
-        self.conn.execute("DELETE FROM training_interactions")
-        self.conn.commit()
-    
-    def build_user_item_matrix_from_db(self, batch_size: int = 10000) -> Tuple[Dict, Dict, Dict, Dict]:
-        """
-        Build user-item matrix incrementally from DuckDB interactions
-        Returns: user_to_index, product_to_index, index_to_user, index_to_product
-        """
-        logger.info("Building user-item matrix from DuckDB...")
-        
-        # Get all unique users and products
-        users_result = self.conn.execute("SELECT DISTINCT user_id FROM training_interactions ORDER BY user_id").fetchall()
-        products_result = self.conn.execute("SELECT DISTINCT product_id FROM training_interactions ORDER BY product_id").fetchall()
-        
-        all_users = [row[0] for row in users_result]
-        all_products = [row[0] for row in products_result]
-        
-        # Create mappings
-        user_to_index = {user_id: i for i, user_id in enumerate(all_users)}
-        product_to_index = {product_id: i for i, product_id in enumerate(all_products)}
-        index_to_user = {i: user_id for user_id, i in user_to_index.items()}
-        index_to_product = {i: product_id for product_id, i in product_to_index.items()}
-        
-        # Clear existing user_item_matrix
-        self.conn.execute("DELETE FROM user_item_matrix")
-        
-        # Process interactions in batches and aggregate scores
-        logger.info(f"Processing interactions for {len(all_users)} users and {len(all_products)} products...")
-        
-        # Use DuckDB to aggregate scores directly
-        self.conn.execute("""
-            INSERT INTO user_item_matrix (user_id, product_id, score)
-            SELECT 
-                user_id,
-                product_id,
-                SUM(score) as score
-            FROM training_interactions
-            GROUP BY user_id, product_id
-        """)
-        
-        self.conn.commit()
-        logger.info("User-item matrix built from DuckDB")
-        
-        return user_to_index, product_to_index, index_to_user, index_to_product
-    
-    def _save_similarities_batch(self, user_similarities: np.ndarray, index_to_user: Dict[int, int]) -> None:
-        """Save user similarities to DuckDB in batches"""
-        logger.info("Saving user similarities to DuckDB...")
-        self.conn.execute("DELETE FROM user_similarities")
-        
-        n_users = user_similarities.shape[0]
-        batch_size = 1000
-        similarity_data = []
-        
-        for i in range(n_users):
-            user_id_1 = index_to_user[i]
-            for j in range(i, n_users):
-                similarity = user_similarities[i, j]
-                if similarity > 0.01:  # Only save meaningful similarities
-                    user_id_2 = index_to_user[j]
-                    similarity_data.append({
-                        'user_id_1': user_id_1,
-                        'user_id_2': user_id_2,
-                        'similarity': float(similarity)
-                    })
-            
-            if len(similarity_data) >= batch_size:
-                df = pl.DataFrame(similarity_data)
-                self.conn.register('temp_similarities', df)
-                self.conn.execute("INSERT INTO user_similarities SELECT * FROM temp_similarities")
-                self.conn.unregister('temp_similarities')
-                similarity_data = []
-                gc.collect()
-        
-        if similarity_data:
-            df = pl.DataFrame(similarity_data)
-            self.conn.register('temp_similarities', df)
-            self.conn.execute("INSERT INTO user_similarities SELECT * FROM temp_similarities")
-            self.conn.unregister('temp_similarities')
-        
-        self.conn.commit()
-        logger.info("User similarities saved to DuckDB")
-    
-    def _save_mappings(self, user_to_index: Dict[int, int], product_to_index: Dict[int, int],
-                      index_to_user: Dict[int, int], index_to_product: Dict[int, int]) -> None:
-        """Save index mappings to DuckDB"""
-        logger.info("Saving index mappings to DuckDB...")
-        
-        # Save user mappings
-        self.conn.execute("DELETE FROM user_index_mapping")
-        user_mapping_data = [
-            {'user_id': uid, 'user_index': idx}
-            for uid, idx in user_to_index.items()
-        ]
-        if user_mapping_data:
-            df = pl.DataFrame(user_mapping_data)
-            self.conn.register('temp_user_mapping', df)
-            self.conn.execute("INSERT INTO user_index_mapping SELECT * FROM temp_user_mapping")
-            self.conn.unregister('temp_user_mapping')
-        
-        # Save product mappings
-        self.conn.execute("DELETE FROM product_index_mapping")
-        product_mapping_data = [
-            {'product_id': pid, 'product_index': idx}
-            for pid, idx in product_to_index.items()
-        ]
-        if product_mapping_data:
-            df = pl.DataFrame(product_mapping_data)
-            self.conn.register('temp_product_mapping', df)
-            self.conn.execute("INSERT INTO product_index_mapping SELECT * FROM temp_product_mapping")
-            self.conn.unregister('temp_product_mapping')
-        
-        self.conn.commit()
-        logger.info("Index mappings saved to DuckDB")
-    
-    def load_user_item_matrix_chunk(self, user_ids: List[int]) -> np.ndarray:
-        """Load a chunk of user-item matrix for specific users"""
-        if not user_ids:
-            return np.array([])
-        
-        placeholders = ','.join(['?'] * len(user_ids))
-        result = self.conn.execute(f"""
-            SELECT user_id, product_id, score
-            FROM user_item_matrix
-            WHERE user_id IN ({placeholders})
-        """, user_ids).fetchall()
-        
-        # Get product indices
-        product_ids = list(set([row[1] for row in result]))
-        product_to_idx = {pid: i for i, pid in enumerate(product_ids)}
-        
-        # Build matrix chunk
-        n_users = len(user_ids)
-        n_products = len(product_ids)
-        matrix_chunk = np.zeros((n_users, n_products))
-        
-        user_to_idx = {uid: i for i, uid in enumerate(user_ids)}
-        for user_id, product_id, score in result:
-            if user_id in user_to_idx and product_id in product_to_idx:
-                matrix_chunk[user_to_idx[user_id], product_to_idx[product_id]] = score
-        
-        return matrix_chunk
-    
     def clear_all(self) -> None:
         """Clear all model data from database"""
         logger.warning("Clearing all model data from database...")
@@ -659,7 +405,6 @@ class ModelStorage:
         self.conn.execute("DELETE FROM user_profiles")
         self.conn.execute("DELETE FROM product_features")
         self.conn.execute("DELETE FROM model_metadata")
-        self.conn.execute("DELETE FROM training_interactions")
         self.conn.commit()
         logger.info("All model data cleared")
     

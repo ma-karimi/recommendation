@@ -184,32 +184,35 @@ class HybridRecommender:
         if not self.content_model:
             return []
         
-        # استفاده از متد بهینه‌سازی شده
-        if hasattr(self.content_model, 'get_product_similarities'):
-            return self.content_model.get_product_similarities(product_id, top_k)
+        # استفاده از متد ANN-based get_similar_products
+        if hasattr(self.content_model, 'get_similar_products'):
+            return self.content_model.get_similar_products(product_id, top_k)
         
-        # Fallback برای حالت قدیمی
-        if product_id not in self.content_model.product_to_index:
-            return []
+        # Fallback برای حالت قدیمی (اگر similarity matrix وجود داشته باشد)
+        if hasattr(self.content_model, 'product_similarities') and self.content_model.product_similarities is not None:
+            if product_id not in self.content_model.product_to_index:
+                return []
+            
+            product_idx = self.content_model.product_to_index[product_id]
+            
+            # بررسی نوع ماتریس
+            if hasattr(self.content_model.product_similarities, 'toarray'):
+                # Sparse Matrix
+                similarities = self.content_model.product_similarities[product_idx].toarray()[0]
+            else:
+                # Dense Matrix
+                similarities = self.content_model.product_similarities[product_idx]
+            
+            similar_products = []
+            for similar_idx, similarity in enumerate(similarities):
+                if similar_idx != product_idx and similarity > 0.1:
+                    similar_product_id = self.content_model.index_to_product[similar_idx]
+                    similar_products.append((similar_product_id, float(similarity)))
+            
+            similar_products.sort(key=lambda x: x[1], reverse=True)
+            return similar_products[:top_k]
         
-        product_idx = self.content_model.product_to_index[product_id]
-        
-        # بررسی نوع ماتریس
-        if hasattr(self.content_model.product_similarities, 'toarray'):
-            # Sparse Matrix
-            similarities = self.content_model.product_similarities[product_idx].toarray()[0]
-        else:
-            # Dense Matrix
-            similarities = self.content_model.product_similarities[product_idx]
-        
-        similar_products = []
-        for similar_idx, similarity in enumerate(similarities):
-            if similar_idx != product_idx and similarity > 0.1:
-                similar_product_id = self.content_model.index_to_product[similar_idx]
-                similar_products.append((similar_product_id, float(similarity)))
-        
-        similar_products.sort(key=lambda x: x[1], reverse=True)
-        return similar_products[:top_k]
+        return []
     
     def get_user_insights(self, user_id: int) -> Dict:
         """دریافت بینش‌های کاربر"""
