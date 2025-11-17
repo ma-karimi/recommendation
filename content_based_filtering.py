@@ -2,13 +2,18 @@ from __future__ import annotations
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+import math
 import os
+import gc
 import logging
+from multiprocessing import cpu_count, Pool
 from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+
 import faiss
-import pickle
 
 from models import User, Product, ProductInteraction, Recommendation
+from object_loader import load_user_purchase_history
 from model_storage import ModelStorage
 from settings import load_config
 
@@ -18,23 +23,17 @@ logger = logging.getLogger(__name__)
 class ContentBasedFiltering:
     """سیستم توصیه مبتنی بر محتوا با استفاده از ANN (Approximate Nearest Neighbor)"""
     
-    def __init__(self, storage: Optional[ModelStorage] = None):
-        """
-        Args:
-            storage: ModelStorage instance for DuckDB operations. If None, creates a new one.
-        """
-        self.storage = storage or ModelStorage()
-        self.vectorizer = None
-        self.ann_index = None
+    def __init__(self, storage: Optional[ModelStorage] = None, use_storage: bool = True):
+        self.product_features = None
+        self.user_profiles = None
         self.product_to_index = {}
         self.index_to_product = {}
-        self.vector_dim = None
+        self.vectorizer = None
+        self.faiss_index = None
         self.index_path = None
-        self.user_profiles = None
-        
-        # Load config for index path
-        cfg = load_config()
-        self.index_path = os.path.join(cfg.output_dir, "product_ann_index.bin")
+        self.use_storage = use_storage
+        self.storage = storage if storage else (ModelStorage() if use_storage else None)
+        self.vector_dim = None
     
     def extract_product_features(self, products: List[Product]) -> Dict[int, Dict]:
         """استخراج ویژگی‌های محصولات"""
@@ -82,377 +81,346 @@ class ContentBasedFiltering:
         else:
             return "high_stock"
     
-    def _compute_tfidf_vectors(self, product_features: Dict[int, Dict]) -> Tuple[np.ndarray, Dict[int, int]]:
+    def build_tfidf_vectors(self, product_features: Dict[int, Dict]) -> None:
         """
-        محاسبه بردارهای TF-IDF برای محصولات
-        
-        Returns:
-            vectors: numpy array of shape (n_products, vector_dim)
-            product_to_index: mapping from product_id to row index in vectors
+        ساخت بردارهای TF-IDF و ذخیره در DuckDB (بدون ساخت ماتریس کامل)
         """
         product_ids = list(product_features.keys())
         n_products = len(product_ids)
+        
+        logger.info(f"Building TF-IDF vectors for {n_products} products...")
         
         # استخراج متن برای TF-IDF
         texts = [product_features[pid]['text'] for pid in product_ids]
         
         # محاسبه TF-IDF
-        logger.info(f"Computing TF-IDF vectors for {n_products} products...")
         self.vectorizer = TfidfVectorizer(
             max_features=1000,
             stop_words=None,  # برای فارسی
             ngram_range=(1, 2)
         )
+        
+        # Transform به صورت batch برای صرفه‌جویی در حافظه
+        logger.info("Computing TF-IDF vectors...")
         tfidf_matrix = self.vectorizer.fit_transform(texts)
         
-        # تبدیل به numpy array (dense)
-        # این فقط برای ساخت index است و بعد از آن حذف می‌شود
-        vectors = tfidf_matrix.toarray().astype('float32')
-        vector_dim = vectors.shape[1]
+        # ذخیره بردارها در DuckDB به صورت batch
+        logger.info("Saving TF-IDF vectors to DuckDB...")
+        product_vectors = {}
         
-        # ایجاد نگاشت
-        product_to_index = {pid: i for i, pid in enumerate(product_ids)}
+        # تبدیل sparse matrix به dict و نرمال‌سازی برای cosine similarity
+        from sklearn.preprocessing import normalize
+        # نرمال‌سازی تمام بردارها (برای cosine similarity)
+        tfidf_matrix_normalized = normalize(tfidf_matrix, norm='l2')
         
-        logger.info(f"TF-IDF vectors computed: shape {vectors.shape}, dimension {vector_dim}")
-        return vectors, product_to_index, vector_dim
-    
-    def _store_vectors_in_duckdb(self, vectors: np.ndarray, product_to_index: Dict[int, int]) -> None:
-        """
-        ذخیره بردارهای TF-IDF در DuckDB به صورت batch
-        """
-        logger.info("Storing TF-IDF vectors in DuckDB...")
+        for i, product_id in enumerate(product_ids):
+            # استخراج بردار برای هر محصول (بدون ساخت ماتریس کامل)
+            vector = tfidf_matrix_normalized[i:i+1]  # Get single row as sparse matrix
+            product_vectors[product_id] = vector
         
-        # Ensure table exists
-        self.storage.conn.execute("""
-            CREATE TABLE IF NOT EXISTS product_tfidf_vectors (
-                product_id INTEGER PRIMARY KEY,
-                vector_index INTEGER,
-                vector_data BLOB  -- Pickled numpy array
-            )
-        """)
-        
-        # Clear existing data
-        self.storage.conn.execute("DELETE FROM product_tfidf_vectors")
-        
-        # Store vectors in batches
-        batch_size = 1000
-        n_products = len(product_to_index)
-        index_to_product = {idx: pid for pid, idx in product_to_index.items()}
-        
-        for i in range(0, n_products, batch_size):
-            batch_data = []
-            end_idx = min(i + batch_size, n_products)
+        # ذخیره در DuckDB
+        if self.storage:
+            self.storage.save_product_vectors_batch(product_vectors)
+            self.storage.save_tfidf_vectorizer(self.vectorizer)
             
-            for vec_idx in range(i, end_idx):
-                product_id = index_to_product[vec_idx]
-                vector = vectors[vec_idx]
-                # Store as pickle for efficient serialization
-                vector_blob = pickle.dumps(vector)
-                batch_data.append({
-                    'product_id': product_id,
-                    'vector_index': vec_idx,
-                    'vector_data': vector_blob
-                })
-            
-            if batch_data:
+            # ذخیره نگاشت
+            product_mapping_data = [
+                {'product_id': pid, 'product_index': i}
+                for i, pid in enumerate(product_ids)
+            ]
+            if product_mapping_data:
                 import polars as pl
-                df = pl.DataFrame(batch_data)
-                self.storage.conn.execute("INSERT INTO product_tfidf_vectors SELECT * FROM df")
-            
-            if (i // batch_size) % 10 == 0:
-                logger.info(f"Stored {end_idx}/{n_products} vectors...")
+                df = pl.DataFrame(product_mapping_data)
+                self.storage.conn.execute("DELETE FROM product_index_mapping")
+                self.storage.conn.execute("INSERT INTO product_index_mapping SELECT * FROM df")
+                self.storage.conn.commit()
         
-        self.storage.conn.commit()
-        logger.info("All TF-IDF vectors stored in DuckDB")
-    
-    def _load_vectors_from_duckdb_batch(self, batch_size: int = 1000) -> Tuple[np.ndarray, List[int]]:
-        """
-        بارگذاری بردارها از DuckDB به صورت batch
+        # ذخیره نگاشت در حافظه
+        self.product_to_index = {pid: i for i, pid in enumerate(product_ids)}
+        self.index_to_product = {i: pid for pid, i in self.product_to_index.items()}
         
-        Returns:
-            vectors: numpy array of shape (batch_size, vector_dim)
-            product_ids: list of product IDs corresponding to rows
-        """
-        result = self.storage.conn.execute(f"""
-            SELECT product_id, vector_index, vector_data
-            FROM product_tfidf_vectors
-            ORDER BY vector_index
-            LIMIT {batch_size}
-            OFFSET ?
-        """, [0]).fetchall()
+        # ذخیره بعد بردار
+        self.vector_dim = tfidf_matrix.shape[1]
         
-        if not result:
-            return None, []
-        
-        vectors_list = []
-        product_ids = []
-        
-        for row in result:
-            product_id, vec_idx, vector_blob = row
-            vector = pickle.loads(vector_blob)
-            vectors_list.append(vector)
-            product_ids.append(product_id)
-        
-        vectors = np.array(vectors_list, dtype='float32')
-        return vectors, product_ids
-    
-    def _build_ann_index_incremental(self, vector_dim: int, n_products: int) -> None:
-        """
-        ساخت ANN index به صورت incremental با استفاده از تمام CPU cores
-        """
-        logger.info(f"Building ANN index incrementally for {n_products} products (dim={vector_dim})...")
-        
-        # استفاده از IndexFlatIP (Inner Product) برای cosine similarity
-        # بعداً normalize می‌کنیم تا cosine similarity شود
-        self.ann_index = faiss.IndexFlatIP(vector_dim)
-        
-        # Enable threading for Faiss operations
-        faiss.omp_set_num_threads(os.cpu_count() or 4)
-        logger.info(f"Using {os.cpu_count() or 4} CPU cores for index building")
-        
-        # Load all vectors in batches and add to index
-        batch_size = 5000  # Process in batches to manage memory
-        total_loaded = 0
-        
-        # First, get total count
-        count_result = self.storage.conn.execute("SELECT COUNT(*) FROM product_tfidf_vectors").fetchone()
-        total_vectors = count_result[0] if count_result else 0
-        
-        offset = 0
-        while offset < total_vectors:
-            # Load batch
-            result = self.storage.conn.execute("""
-                SELECT product_id, vector_index, vector_data
-                FROM product_tfidf_vectors
-                ORDER BY vector_index
-                LIMIT ? OFFSET ?
-            """, [batch_size, offset]).fetchall()
-            
-            if not result:
-                break
-            
-            # Deserialize vectors
-            vectors_list = []
-            product_ids_batch = []
-            
-            for row in result:
-                product_id, vec_idx, vector_blob = row
-                vector = pickle.loads(vector_blob)
-                vectors_list.append(vector)
-                product_ids_batch.append(product_id)
-            
-            if not vectors_list:
-                break
-            
-            # Convert to numpy array
-            vectors_batch = np.array(vectors_list, dtype='float32')
-            
-            # Normalize vectors for cosine similarity (L2 normalization)
-            faiss.normalize_L2(vectors_batch)
-            
-            # Add to index
-            self.ann_index.add(vectors_batch)
-            
-            # Update mappings
-            for i, product_id in enumerate(product_ids_batch):
-                actual_index = total_loaded + i
-                self.product_to_index[product_id] = actual_index
-                self.index_to_product[actual_index] = product_id
-            
-            total_loaded += len(vectors_batch)
-            offset += batch_size
-            
-            if total_loaded % 10000 == 0 or total_loaded == total_vectors:
-                logger.info(f"Indexed {total_loaded}/{total_vectors} vectors...")
-        
-        logger.info(f"ANN index built successfully with {self.ann_index.ntotal} vectors")
-    
-    def build_product_similarity_index(self, product_features: Dict[int, Dict], force_rebuild: bool = False) -> None:
-        """
-        ساخت ANN index برای محصولات (جایگزین similarity matrix)
-        این تابع بردارهای TF-IDF را محاسبه می‌کند، در DuckDB ذخیره می‌کند،
-        و سپس ANN index را به صورت incremental می‌سازد.
-        
-        Args:
-            product_features: Dictionary of product features
-            force_rebuild: If True, rebuild index even if it exists on disk
-        """
-        # Check if index already exists and can be loaded
-        if not force_rebuild and self._load_index_from_disk():
-            logger.info("Loaded existing ANN index from disk")
-            return
-        
-        logger.info("Building product similarity index using ANN...")
-        
-        # 1. محاسبه بردارهای TF-IDF
-        vectors, product_to_index, vector_dim = self._compute_tfidf_vectors(product_features)
-        self.vector_dim = vector_dim
-        self.product_to_index = product_to_index
-        self.index_to_product = {idx: pid for pid, idx in product_to_index.items()}
-        
-        # 2. ذخیره بردارها در DuckDB
-        self._store_vectors_in_duckdb(vectors, product_to_index)
-        
-        # 3. پاک کردن vectors از RAM
-        del vectors
-        import gc
+        # پاک کردن ماتریس از حافظه
+        del tfidf_matrix
         gc.collect()
         
-        # 4. ساخت ANN index به صورت incremental
-        n_products = len(product_to_index)
-        self._build_ann_index_incremental(vector_dim, n_products)
-        
-        # 5. ذخیره index روی disk
-        self._save_index_to_disk()
-        
-        logger.info("Product similarity index built and saved successfully")
+        logger.info(f"TF-IDF vectors saved. Vector dimension: {self.vector_dim}")
     
-    def _save_index_to_disk(self) -> None:
-        """ذخیره ANN index روی disk"""
-        if self.ann_index is None:
+    def build_ann_index(self, index_type: str = "IVF", nlist: int = 100, nprobe: int = 10, n_threads: int = -1) -> None:
+        """
+        ساخت ANN index با استفاده از Faiss به صورت incremental از DuckDB
+        
+        Args:
+            index_type: نوع index ("IVF", "Flat", "HNSW")
+            nlist: تعداد clusters برای IVF
+            nprobe: تعداد clusters برای جستجو در IVF
+            n_threads: تعداد thread برای Faiss (-1 = همه هسته‌ها)
+        """
+        if not self.storage:
+            raise ValueError("Storage is required for building ANN index")
+        
+        # تنظیم تعداد thread برای Faiss
+        if n_threads == -1:
+            n_threads = cpu_count()
+        faiss.omp_set_num_threads(n_threads)
+        
+        logger.info(f"Building ANN index from DuckDB using {n_threads} threads...")
+        
+        # دریافت تمام product IDs
+        product_ids = self.storage.get_all_product_ids_with_vectors()
+        if not product_ids:
+            raise ValueError("No product vectors found in storage")
+        
+        # دریافت بعد بردار
+        vector_dim = self.storage.get_vector_dimension()
+        if not vector_dim:
+            raise ValueError("Vector dimension not found")
+        
+        self.vector_dim = vector_dim
+        n_products = len(product_ids)
+        
+        logger.info(f"Building index for {n_products} products with dimension {vector_dim}...")
+        
+        # ساخت index بر اساس نوع
+        # استفاده از Inner Product برای cosine similarity (vectors are normalized)
+        if index_type == "IVF":
+            # IVF (Inverted File Index) - مناسب برای مجموعه‌های بزرگ
+            # استفاده از Inner Product برای cosine similarity
+            quantizer = faiss.IndexFlatIP(vector_dim)
+            nlist = min(nlist, max(1, n_products // 10))
+            self.faiss_index = faiss.IndexIVFFlat(quantizer, vector_dim, nlist)
+            self.faiss_index.nprobe = nprobe
+        elif index_type == "HNSW":
+            # HNSW (Hierarchical Navigable Small World) - سریع‌تر اما حافظه بیشتر
+            self.faiss_index = faiss.IndexHNSWFlat(vector_dim, 32)
+            # HNSW با Inner Product
+            self.faiss_index.metric = faiss.METRIC_INNER_PRODUCT
+        else:
+            # Flat index با Inner Product برای cosine similarity
+            self.faiss_index = faiss.IndexFlatIP(vector_dim)
+        
+        # بارگذاری و اضافه کردن بردارها به صورت batch
+        batch_size = 1000
+        n_batches = (n_products + batch_size - 1) // batch_size
+        
+        logger.info(f"Loading vectors in {n_batches} batches of {batch_size}...")
+        
+        # برای IVF، ابتدا باید train شود
+        if isinstance(self.faiss_index, faiss.IndexIVFFlat):
+            # Train با نمونه‌ای از بردارها
+            logger.info("Training IVF index...")
+            train_batch_size = min(10000, n_products)
+            train_ids = product_ids[:train_batch_size]
+            train_vectors = self.storage.load_product_vectors_batch(train_ids)
+            
+            # تبدیل به numpy array
+            train_data = np.array([train_vectors[pid] for pid in train_ids if pid in train_vectors], dtype=np.float32)
+            
+            if len(train_data) > 0:
+                self.faiss_index.train(train_data)
+                logger.info("IVF index trained")
+            
+            del train_data, train_vectors
+            gc.collect()
+        
+        # Initialize mapping
+        self.product_to_index = {}
+        self.index_to_product = {}
+        
+        # اضافه کردن تمام بردارها
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_products)
+            batch_ids = product_ids[start_idx:end_idx]
+            
+            # بارگذاری بردارها از DuckDB
+            batch_vectors = self.storage.load_product_vectors_batch(batch_ids)
+            
+            if not batch_vectors:
+                continue
+            
+            # تبدیل به numpy array
+            vectors_list = []
+            valid_ids = []
+            for pid in batch_ids:
+                if pid in batch_vectors:
+                    vectors_list.append(batch_vectors[pid])
+                    valid_ids.append(pid)
+            
+            if vectors_list:
+                vectors_array = np.array(vectors_list, dtype=np.float32)
+                
+                # ذخیره موقعیت فعلی قبل از add
+                start_faiss_idx = self.faiss_index.ntotal
+                
+                # اضافه کردن به index
+                self.faiss_index.add(vectors_array)
+                
+                # به‌روزرسانی نگاشت - هر product_id به موقعیت خود در index
+                for local_idx, pid in enumerate(valid_ids):
+                    faiss_idx = start_faiss_idx + local_idx
+                    self.product_to_index[pid] = faiss_idx
+                    self.index_to_product[faiss_idx] = pid
+            
+            del batch_vectors, vectors_list, vectors_array
+            gc.collect()
+            
+            if (batch_idx + 1) % 10 == 0:
+                logger.info(f"Processed {batch_idx + 1}/{n_batches} batches ({self.faiss_index.ntotal} vectors added)")
+        
+        logger.info(f"ANN index built successfully with {self.faiss_index.ntotal} vectors")
+        
+        # ذخیره index در دیسک
+        self._save_ann_index()
+    
+    def _save_ann_index(self) -> None:
+        """ذخیره ANN index در دیسک"""
+        if not self.faiss_index:
             return
         
-        os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
-        faiss.write_index(self.ann_index, self.index_path)
+        cfg = load_config()
+        index_dir = cfg.output_dir
+        os.makedirs(index_dir, exist_ok=True)
         
-        # Save mappings and metadata
-        metadata = {
-            'product_to_index': self.product_to_index,
-            'index_to_product': self.index_to_product,
-            'vector_dim': self.vector_dim
-        }
+        self.index_path = os.path.join(index_dir, "product_ann_index.faiss")
         
-        metadata_path = self.index_path.replace('.bin', '_metadata.pkl')
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata, f)
+        logger.info(f"Saving ANN index to {self.index_path}...")
+        faiss.write_index(self.faiss_index, self.index_path)
         
-        # Save vectorizer
-        if self.vectorizer is not None:
-            vectorizer_path = self.index_path.replace('.bin', '_vectorizer.pkl')
-            with open(vectorizer_path, 'wb') as f:
-                pickle.dump(self.vectorizer, f)
+        # ذخیره مسیر در metadata
+        if self.storage:
+            self.storage.save_ann_index_path(self.index_path)
         
-        # Store index path in DuckDB metadata
-        self.storage.conn.execute("""
-            INSERT OR REPLACE INTO model_metadata (key, value)
-            VALUES ('product_ann_index_path', ?)
-        """, [self.index_path])
-        self.storage.conn.commit()
-        
-        logger.info(f"ANN index saved to {self.index_path}")
+        logger.info("ANN index saved successfully")
     
-    def _load_index_from_disk(self) -> bool:
-        """بارگذاری ANN index از disk"""
-        # Check if index exists
-        if not os.path.exists(self.index_path):
-            # Try loading path from metadata
+    def _load_ann_index(self, n_threads: int = -1) -> bool:
+        """بارگذاری ANN index از دیسک"""
+        if not self.storage:
+            return False
+        
+        index_path = self.storage.get_ann_index_path()
+        if not index_path or not os.path.exists(index_path):
+            return False
+        
+        # تنظیم تعداد thread برای Faiss
+        if n_threads == -1:
+            n_threads = cpu_count()
+        faiss.omp_set_num_threads(n_threads)
+        
+        logger.info(f"Loading ANN index from {index_path} using {n_threads} threads...")
+        try:
+            self.faiss_index = faiss.read_index(index_path)
+            self.index_path = index_path
+            
+            # بارگذاری نگاشت از product_index_mapping در DuckDB
             result = self.storage.conn.execute("""
-                SELECT value FROM model_metadata WHERE key = 'product_ann_index_path'
-            """).fetchone()
+                SELECT product_id, product_index 
+                FROM product_index_mapping 
+                ORDER BY product_index
+            """).fetchall()
             
-            if result:
-                self.index_path = result[0]
+            self.product_to_index = {}
+            self.index_to_product = {}
             
-            if not os.path.exists(self.index_path):
-                return False
-        
-        # Load index
-        self.ann_index = faiss.read_index(self.index_path)
-        
-        # Load metadata
-        metadata_path = self.index_path.replace('.bin', '_metadata.pkl')
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'rb') as f:
-                metadata = pickle.load(f)
-                self.product_to_index = metadata['product_to_index']
-                self.index_to_product = metadata['index_to_product']
-                self.vector_dim = metadata['vector_dim']
-        
-        # Load vectorizer
-        vectorizer_path = self.index_path.replace('.bin', '_vectorizer.pkl')
-        if os.path.exists(vectorizer_path):
-            with open(vectorizer_path, 'rb') as f:
-                self.vectorizer = pickle.load(f)
-        
-        logger.info(f"ANN index loaded from {self.index_path}")
-        return True
+            for product_id, product_index in result:
+                self.product_to_index[product_id] = product_index
+                self.index_to_product[product_index] = product_id
+            
+            # بارگذاری vectorizer
+            self.vectorizer = self.storage.load_tfidf_vectorizer()
+            
+            # دریافت بعد بردار
+            self.vector_dim = self.storage.get_vector_dimension()
+            
+            logger.info(f"ANN index loaded successfully ({self.faiss_index.ntotal} vectors)")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load ANN index: {e}")
+            return False
     
     def get_similar_products(self, product_id: int, k: int = 20) -> List[Tuple[int, float]]:
         """
-        دریافت محصولات مشابه برای یک محصول با استفاده از ANN index
+        دریافت محصولات مشابه با استفاده از ANN (بدون بارگذاری ماتریس کامل)
         
         Args:
             product_id: شناسه محصول
-            k: تعداد محصولات مشابه مورد نیاز
+            k: تعداد محصولات مشابه
         
         Returns:
-            List of (product_id, similarity_score) tuples
+            لیست tuple های (product_id, similarity_score)
         """
-        if self.ann_index is None:
-            # Try to load from disk
-            if not self._load_index_from_disk():
-                logger.error("ANN index not found. Please train the model first.")
+        # بارگذاری index اگر وجود ندارد
+        if self.faiss_index is None:
+            if not self._load_ann_index():
+                logger.warning("ANN index not available")
                 return []
         
-        if product_id not in self.product_to_index:
-            logger.warning(f"Product {product_id} not found in index")
+        # بارگذاری بردار محصول از DuckDB
+        if not self.storage:
+            logger.warning("Storage not available")
             return []
         
-        # Get product vector from DuckDB
-        result = self.storage.conn.execute("""
-            SELECT vector_data FROM product_tfidf_vectors WHERE product_id = ?
-        """, [product_id]).fetchone()
-        
-        if not result:
+        # Use read-only connection for querying
+        product_vector = self.storage.load_product_vector(product_id)
+        if product_vector is None:
             logger.warning(f"Vector not found for product {product_id}")
             return []
         
-        # Deserialize vector
-        vector = pickle.loads(result[0])
-        query_vector = vector.reshape(1, -1).astype('float32')
+        # تبدیل به numpy array و reshape
+        query_vector = np.array([product_vector], dtype=np.float32)
         
-        # Normalize for cosine similarity
-        faiss.normalize_L2(query_vector)
+        # جستجو در ANN index
+        k = min(k + 1, self.faiss_index.ntotal)  # +1 because result includes the query itself
+        distances, indices = self.faiss_index.search(query_vector, k)
         
-        # Search in ANN index
-        # k+1 because the product itself will be in results
-        distances, indices = self.ann_index.search(query_vector, k + 1)
-        
-        # Convert indices to product IDs and filter out the query product itself
+        # تبدیل نتایج به product_id و similarity
         similar_products = []
-        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-            if idx < len(self.index_to_product):
-                similar_product_id = self.index_to_product[idx]
-                if similar_product_id != product_id:  # Exclude self
-                    # dist is already cosine similarity (inner product after normalization)
-                    similarity = float(dist)
-                    similar_products.append((similar_product_id, similarity))
+        for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx < 0:  # Invalid index
+                continue
+            
+            similar_product_id = self.index_to_product.get(idx)
+            if similar_product_id is None or similar_product_id == product_id:
+                continue
+            
+            # برای Inner Product index، distance در واقع similarity است (cosine similarity برای normalized vectors)
+            # Inner product روی normalized vectors = cosine similarity
+            similarity = float(distance)
+            
+            # اطمینان از اینکه similarity در محدوده معقول است
+            similarity = max(0.0, min(1.0, similarity))
+            
+            similar_products.append((similar_product_id, similarity))
         
-        return similar_products[:k]
+        # مرتب‌سازی بر اساس similarity
+        similar_products.sort(key=lambda x: x[1], reverse=True)
+        
+        return similar_products[:k-1]  # Exclude the query product itself
     
     def _add_numerical_similarities(self, product_features: Dict[int, Dict], 
                                    similar_products: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
         """
         اضافه کردن شباهت بر اساس ویژگی‌های عددی به نتایج ANN
-        این تابع نتایج ANN را با در نظر گیری ویژگی‌های عددی تنظیم می‌کند.
         """
-        if not similar_products:
+        if not product_features or not similar_products:
             return similar_products
         
-        # Get query product features (assume it's passed via context)
-        # For now, we'll adjust scores based on numerical features
-        adjusted_products = []
+        # ترکیب شباهت متنی با شباهت عددی
+        enhanced_similarities = []
         
-        for product_id, ann_score in similar_products:
+        for product_id, text_similarity in similar_products:
             if product_id not in product_features:
-                adjusted_products.append((product_id, ann_score))
+                enhanced_similarities.append((product_id, text_similarity))
                 continue
             
-            # Numerical similarity boost (simplified - in practice, you'd compare with query product)
-            # This is a placeholder - in real implementation, you'd need the query product_id
-            adjusted_products.append((product_id, ann_score))
+            # محاسبه شباهت عددی (این بخش نیاز به product_id اصلی دارد که در query استفاده می‌شود)
+            # برای سادگی، فقط شباهت متنی را برمی‌گردانیم
+            # در صورت نیاز می‌توان این بخش را گسترش داد
+            enhanced_similarities.append((product_id, text_similarity))
         
-        return adjusted_products
+        return enhanced_similarities
     
     def build_user_profiles(self, user_interactions: Dict[int, List[ProductInteraction]], 
                           product_features: Dict[int, Dict]) -> None:
@@ -540,7 +508,7 @@ class ContentBasedFiltering:
         return dict(seller_weights)
     
     def get_user_recommendations(self, user_id: int, top_k: int = 10) -> List[Recommendation]:
-        """دریافت توصیه‌های کاربر"""
+        """دریافت توصیه‌های کاربر با استفاده از ANN"""
         if user_id not in self.user_profiles:
             return []
         
@@ -551,28 +519,26 @@ class ContentBasedFiltering:
         recommendations = []
         seen_products = set(product_weights.keys())
         
-        # Collect similar products from all liked products
-        all_similar = defaultdict(float)
-        
         for liked_product_id, weight in product_weights.items():
-            # Get similar products using ANN
-            similar_products = self.get_similar_products(liked_product_id, k=50)
+            # استفاده از ANN برای پیدا کردن محصولات مشابه
+            similar_products = self.get_similar_products(liked_product_id, k=top_k * 2)
             
             for similar_product_id, similarity in similar_products:
                 if similar_product_id not in seen_products:
-                    # Combine similarity with user's preference weight
                     score = similarity * weight
-                    all_similar[similar_product_id] = max(all_similar[similar_product_id], score)
+                    recommendations.append((similar_product_id, score))
         
-        # Sort by score and take top_k
-        sorted_recommendations = sorted(
-            all_similar.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )[:top_k]
+        # مرتب‌سازی و حذف تکراری‌ها
+        recommendations.sort(key=lambda x: x[1], reverse=True)
+        
+        # حذف تکراری‌ها و انتخاب بهترین‌ها
+        unique_recommendations = {}
+        for product_id, score in recommendations:
+            if product_id not in unique_recommendations:
+                unique_recommendations[product_id] = score
         
         final_recommendations = []
-        for product_id, score in sorted_recommendations:
+        for product_id, score in list(unique_recommendations.items())[:top_k]:
             final_recommendations.append(Recommendation(
                 user_id=user_id,
                 product_id=product_id,
@@ -584,24 +550,63 @@ class ContentBasedFiltering:
         return final_recommendations
 
 
-def train_content_based_model(products: List[Product], 
-                            user_interactions: Dict[int, List[ProductInteraction]],
-                            storage: Optional[ModelStorage] = None) -> ContentBasedFiltering:
+def train_content_based_model(
+    products: List[Product], 
+    user_interactions: Dict[int, List[ProductInteraction]],
+    storage: Optional[ModelStorage] = None,
+    use_storage: bool = True,
+    rebuild_index: bool = True,
+    n_threads: int = -1
+) -> ContentBasedFiltering:
     """
     آموزش مدل content-based filtering با استفاده از ANN
     
     Args:
         products: لیست محصولات
         user_interactions: تعاملات کاربران
-        storage: ModelStorage instance (optional)
+        storage: ModelStorage instance (اختیاری)
+        use_storage: استفاده از storage برای ذخیره‌سازی
+        rebuild_index: ساخت مجدد ANN index (اگر False، از index موجود استفاده می‌کند)
+        n_threads: تعداد thread برای Faiss (-1 = همه هسته‌ها)
     """
-    model = ContentBasedFiltering(storage=storage)
+    logger.info("Training Content-Based Filtering model with ANN...")
+    
+    # تنظیم تعداد thread
+    if n_threads == -1:
+        n_threads = cpu_count()
+    logger.info(f"Using {n_threads} CPU threads for training...")
+    
+    model = ContentBasedFiltering(storage=storage, use_storage=use_storage)
+    
+    # استخراج ویژگی‌های محصولات
+    logger.info("Extracting product features...")
     product_features = model.extract_product_features(products)
     
-    # Build ANN index instead of full similarity matrix
-    model.build_product_similarity_index(product_features)
+    # ساخت بردارهای TF-IDF و ذخیره در DuckDB
+    logger.info("Building TF-IDF vectors...")
+    model.build_tfidf_vectors(product_features)
     
-    # Build user profiles
+    # ساخت ANN index
+    if rebuild_index or not model._load_ann_index(n_threads=n_threads):
+        logger.info("Building ANN index...")
+        # استفاده از IVF برای مجموعه‌های بزرگ
+        n_products = len(products)
+        nlist = min(100, max(10, n_products // 100))  # تعداد clusters
+        model.build_ann_index(index_type="IVF", nlist=nlist, nprobe=10, n_threads=n_threads)
+    else:
+        logger.info("Using existing ANN index")
+    
+    # ساخت پروفایل کاربران
+    logger.info("Building user profiles...")
     model.build_user_profiles(user_interactions, product_features)
     
+    # ذخیره product features در storage
+    if model.storage:
+        model.storage.save_content_model(
+            user_profiles=model.user_profiles,
+            product_features=product_features,
+            product_similarities_path=None  # No longer using similarity matrix
+        )
+    
+    logger.info("Content-Based Filtering model trained successfully!")
     return model

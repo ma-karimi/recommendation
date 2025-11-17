@@ -9,69 +9,170 @@ Key features:
 - Batch loading of only needed data during inference
 - Memory-efficient storage using Parquet format
 - Automatic cleanup and garbage collection
+- Connection pooling and read-only access to prevent lock conflicts
 """
 from __future__ import annotations
 import os
 import gc
 import logging
 import pickle
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 from scipy.sparse import csr_matrix, save_npz, load_npz
 import duckdb
 import polars as pl
+import threading
 
 from settings import load_config
 
 logger = logging.getLogger(__name__)
 
+# Global connection pool to prevent multiple write connections
+_connection_lock = threading.Lock()
+_connection_pool: Dict[str, duckdb.DuckDBPyConnection] = {}
+
 
 class ModelStorage:
     """Manages storage and retrieval of model data using DuckDB"""
     
-    def __init__(self, db_path: Optional[str] = None, reuse_connection: Optional['duckdb.DuckDBPyConnection'] = None):
+    def __init__(self, db_path: Optional[str] = None, read_only: bool = False, max_retries: int = 3):
         """
         Args:
             db_path: Path to DuckDB database file. If None, uses default location.
-            reuse_connection: Existing DuckDB connection to reuse (optional).
+            read_only: If True, opens connection in read-only mode (allows multiple readers)
+            max_retries: Maximum number of retries for acquiring lock
         """
         cfg = load_config()
         if db_path is None:
             db_path = os.path.join(cfg.output_dir, "model_data.duckdb")
         
-        self.db_path = db_path
+        self.db_path = os.path.abspath(db_path)  # Use absolute path for consistency
+        self.read_only = read_only
+        self.max_retries = max_retries
+        self.conn = None
+        self._ensure_db()
+    
+    def _get_connection(self, read_only: Optional[bool] = None) -> duckdb.DuckDBPyConnection:
+        """
+        Get a database connection with retry logic and connection pooling
         
-        # Reuse existing connection if provided
-        if reuse_connection is not None:
-            self.conn = reuse_connection
-            logger.info(f"Reusing existing DuckDB connection for {self.db_path}")
-        else:
-            self.conn = None
-            self._ensure_db()
+        Args:
+            read_only: Override instance read_only setting for this connection
+        """
+        if read_only is None:
+            read_only = self.read_only
+        
+        # For read-only connections, always create a new connection (DuckDB allows multiple readers)
+        if read_only:
+            try:
+                return duckdb.connect(self.db_path, read_only=True)
+            except Exception as e:
+                logger.warning(f"Failed to open read-only connection: {e}, retrying...")
+                time.sleep(0.1)
+                return duckdb.connect(self.db_path, read_only=True)
+        
+        # For write connections, use connection pooling to prevent multiple write connections
+        with _connection_lock:
+            if self.db_path in _connection_pool:
+                conn = _connection_pool[self.db_path]
+                # Check if connection is still valid
+                try:
+                    conn.execute("SELECT 1")
+                    return conn
+                except:
+                    # Connection is dead, remove from pool
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    del _connection_pool[self.db_path]
+            
+            # Try to create a new write connection with retry logic
+            for attempt in range(self.max_retries):
+                try:
+                    conn = duckdb.connect(self.db_path, read_only=False)
+                    _connection_pool[self.db_path] = conn
+                    return conn
+                except Exception as e:
+                    if "lock" in str(e).lower() or "conflicting" in str(e).lower():
+                        if attempt < self.max_retries - 1:
+                            wait_time = (2 ** attempt) * 0.5  # Exponential backoff
+                            logger.warning(
+                                f"Could not acquire lock (attempt {attempt + 1}/{self.max_retries}), "
+                                f"retrying in {wait_time:.1f}s..."
+                            )
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            # Extract PID from error message if available
+                            error_str = str(e)
+                            pid = None
+                            if "PID" in error_str:
+                                import re
+                                pid_match = re.search(r'PID\s+(\d+)', error_str)
+                                if pid_match:
+                                    pid = pid_match.group(1)
+                            
+                            error_msg = (
+                                f"Could not acquire DuckDB lock after {self.max_retries} attempts.\n"
+                                f"Another process is using the database file: {self.db_path}\n"
+                            )
+                            
+                            if pid:
+                                error_msg += (
+                                    f"\nConflicting process: PID {pid}\n"
+                                    f"To fix this, you can:\n"
+                                    f"  1. Kill the process: kill {pid}\n"
+                                    f"  2. Or wait for it to finish\n"
+                                    f"  3. Or use read-only mode: ModelStorage(read_only=True)\n"
+                                )
+                            
+                            error_msg += f"\nOriginal error: {e}"
+                            
+                            raise RuntimeError(error_msg) from e
+                    else:
+                        raise
     
     def _ensure_db(self) -> None:
         """Ensure database file and tables exist"""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         
-        # Connect to DuckDB
-        # Note: DuckDB doesn't support concurrent write access by default
-        # Multiple processes cannot write to the same database file simultaneously
+        # Try to get a write connection for table creation
+        # If read_only, we'll try to get a temporary write connection just for schema creation
         try:
-            self.conn = duckdb.connect(self.db_path)
+            if self.read_only:
+                # For read-only mode, try to open write connection just for schema check
+                # If it fails, assume tables already exist
+                try:
+                    temp_conn = duckdb.connect(self.db_path, read_only=False)
+                    self._create_tables(temp_conn)
+                    temp_conn.close()
+                except Exception as e:
+                    if "lock" in str(e).lower():
+                        logger.info("Database is locked, assuming tables exist (read-only mode)")
+                    else:
+                        raise
+            else:
+                self.conn = self._get_connection(read_only=False)
+                self._create_tables(self.conn)
+                # Update self.conn to use the pooled connection
+                if not self.read_only:
+                    self.conn = self._get_connection(read_only=False)
         except Exception as e:
-            # If connection fails due to lock, provide helpful error message
-            if 'lock' in str(e).lower() or 'conflicting' in str(e).lower():
-                logger.error(
-                    f"DuckDB lock conflict on {self.db_path}. "
-                    f"Another process (PID mentioned in error) may be using the database. "
-                    f"Please close other processes or wait for them to finish. "
-                    f"To check: ps -p <PID> or kill <PID> if safe to do so."
-                )
-            raise
-        
+            if "lock" in str(e).lower() or "conflicting" in str(e).lower():
+                # If we can't get write lock, try read-only
+                logger.warning(f"Could not get write lock, trying read-only mode: {e}")
+                self.read_only = True
+                self.conn = self._get_connection(read_only=True)
+            else:
+                raise
+    
+    def _create_tables(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Create database tables if they don't exist"""
         # Create tables for collaborative filtering data
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS user_item_matrix (
                 user_id INTEGER,
                 product_id INTEGER,
@@ -80,7 +181,7 @@ class ModelStorage:
             )
         """)
         
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS user_similarities (
                 user_id_1 INTEGER,
                 user_id_2 INTEGER,
@@ -90,14 +191,14 @@ class ModelStorage:
         """)
         
         # Create tables for mappings
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS user_index_mapping (
                 user_id INTEGER PRIMARY KEY,
                 user_index INTEGER
             )
         """)
         
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS product_index_mapping (
                 product_id INTEGER PRIMARY KEY,
                 product_index INTEGER
@@ -105,38 +206,38 @@ class ModelStorage:
         """)
         
         # Create tables for content-based filtering
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS user_profiles (
                 user_id INTEGER PRIMARY KEY,
                 profile_data BLOB  -- Pickled dict
             )
         """)
         
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS product_features (
                 product_id INTEGER PRIMARY KEY,
                 features_data BLOB  -- Pickled dict
             )
         """)
         
-        # Create table for TF-IDF vectors (used by ANN-based content filtering)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS product_tfidf_vectors (
+        # Create table for product TF-IDF vectors (stored as arrays)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_vectors (
                 product_id INTEGER PRIMARY KEY,
-                vector_index INTEGER,
-                vector_data BLOB  -- Pickled numpy array
+                vector_data BLOB,  -- Pickled numpy array
+                vector_dim INTEGER  -- Dimension of the vector
             )
         """)
         
         # Store sparse matrix metadata
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS model_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
         
-        logger.info(f"Model storage initialized at {self.db_path}")
+        logger.info(f"Model storage initialized at {self.db_path} (read_only={self.read_only})")
     
     def save_collaborative_model(
         self,
@@ -148,13 +249,19 @@ class ModelStorage:
         index_to_product: Dict[int, int]
     ) -> None:
         """Save collaborative filtering model data to DuckDB"""
+        if self.read_only:
+            raise RuntimeError("Cannot save model: storage is in read-only mode")
+        
         logger.info("Saving collaborative filtering model to DuckDB...")
         
+        # Ensure we have a write connection
+        conn = self._get_connection(read_only=False)
+        
         # Clear existing data
-        self.conn.execute("DELETE FROM user_item_matrix")
-        self.conn.execute("DELETE FROM user_similarities")
-        self.conn.execute("DELETE FROM user_index_mapping")
-        self.conn.execute("DELETE FROM product_index_mapping")
+        conn.execute("DELETE FROM user_item_matrix")
+        conn.execute("DELETE FROM user_similarities")
+        conn.execute("DELETE FROM user_index_mapping")
+        conn.execute("DELETE FROM product_index_mapping")
         
         # Save user-item matrix (only non-zero values)
         logger.info("Saving user-item matrix...")
@@ -173,7 +280,7 @@ class ModelStorage:
         
         if user_item_data:
             df = pl.DataFrame(user_item_data)
-            self.conn.execute("INSERT INTO user_item_matrix SELECT * FROM df")
+            conn.execute("INSERT INTO user_item_matrix SELECT * FROM df")
         
         # Save user similarities (only non-zero, upper triangle)
         logger.info("Saving user similarities...")
@@ -195,13 +302,13 @@ class ModelStorage:
             
             if len(similarity_data) >= batch_size:
                 df = pl.DataFrame(similarity_data)
-                self.conn.execute("INSERT INTO user_similarities SELECT * FROM df")
+                conn.execute("INSERT INTO user_similarities SELECT * FROM df")
                 similarity_data = []
                 gc.collect()
         
         if similarity_data:
             df = pl.DataFrame(similarity_data)
-            self.conn.execute("INSERT INTO user_similarities SELECT * FROM df")
+            conn.execute("INSERT INTO user_similarities SELECT * FROM df")
         
         # Save mappings
         logger.info("Saving index mappings...")
@@ -216,24 +323,25 @@ class ModelStorage:
         
         if user_mapping_data:
             df = pl.DataFrame(user_mapping_data)
-            self.conn.execute("INSERT INTO user_index_mapping SELECT * FROM df")
+            conn.execute("INSERT INTO user_index_mapping SELECT * FROM df")
         
         if product_mapping_data:
             df = pl.DataFrame(product_mapping_data)
-            self.conn.execute("INSERT INTO product_index_mapping SELECT * FROM df")
+            conn.execute("INSERT INTO product_index_mapping SELECT * FROM df")
         
         # Save metadata
-        self.conn.execute("""
+        conn.execute("""
             INSERT OR REPLACE INTO model_metadata (key, value)
             VALUES ('n_users', ?), ('n_products', ?)
         """, [str(len(user_to_index)), str(len(product_to_index))])
         
-        self.conn.commit()
+        conn.commit()
         logger.info("Collaborative model saved successfully")
     
     def load_user_item_row(self, user_id: int) -> Dict[int, float]:
         """Load a single user's item ratings from database"""
-        result = self.conn.execute("""
+        conn = self._get_connection(read_only=True)
+        result = conn.execute("""
             SELECT product_id, score
             FROM user_item_matrix
             WHERE user_id = ?
@@ -243,6 +351,7 @@ class ModelStorage:
     
     def load_user_similarities(self, user_id: int, top_k: Optional[int] = None) -> List[Tuple[int, float]]:
         """Load similar users for a given user"""
+        conn = self._get_connection(read_only=True)
         query = """
             SELECT user_id_2, similarity
             FROM user_similarities
@@ -257,7 +366,7 @@ class ModelStorage:
         if top_k:
             query += f" LIMIT {top_k}"
         
-        result = self.conn.execute(query, [user_id, user_id, user_id, user_id]).fetchall()
+        result = conn.execute(query, [user_id, user_id, user_id, user_id]).fetchall()
         return [(row[0], row[1]) for row in result]
     
     def get_user_index(self, user_id: int) -> Optional[int]:
@@ -383,6 +492,116 @@ class ModelStorage:
             for row in result
         }
     
+    def save_product_vectors_batch(self, product_vectors: Dict[int, np.ndarray]) -> None:
+        """Save product TF-IDF vectors to DuckDB in batches"""
+        if not product_vectors:
+            return
+        
+        logger.info(f"Saving {len(product_vectors)} product vectors to DuckDB...")
+        vector_data = []
+        
+        for product_id, vector in product_vectors.items():
+            # Convert sparse to dense if needed
+            if hasattr(vector, 'toarray'):
+                vector = vector.toarray().flatten()
+            elif hasattr(vector, 'todense'):
+                vector = vector.todense().flatten()
+            
+            vector_data.append({
+                'product_id': product_id,
+                'vector_data': pickle.dumps(vector.astype(np.float32)),
+                'vector_dim': len(vector)
+            })
+        
+        # Save in batches
+        batch_size = 1000
+        for i in range(0, len(vector_data), batch_size):
+            batch = vector_data[i:i + batch_size]
+            df = pl.DataFrame(batch)
+            self.conn.execute("""
+                INSERT OR REPLACE INTO product_vectors 
+                SELECT product_id, vector_data, vector_dim FROM df
+            """)
+            gc.collect()
+        
+        self.conn.commit()
+        logger.info("Product vectors saved successfully")
+    
+    def load_product_vector(self, product_id: int) -> Optional[np.ndarray]:
+        """Load a single product vector from DuckDB"""
+        conn = self._get_connection(read_only=True)
+        result = conn.execute("""
+            SELECT vector_data FROM product_vectors WHERE product_id = ?
+        """, [product_id]).fetchone()
+        
+        if result:
+            return pickle.loads(result[0])
+        return None
+    
+    def load_product_vectors_batch(self, product_ids: List[int], batch_size: int = 1000) -> Dict[int, np.ndarray]:
+        """Load product vectors in batches from DuckDB"""
+        if not product_ids:
+            return {}
+        
+        conn = self._get_connection(read_only=True)
+        vectors = {}
+        for i in range(0, len(product_ids), batch_size):
+            batch_ids = product_ids[i:i + batch_size]
+            placeholders = ','.join(['?'] * len(batch_ids))
+            result = conn.execute(f"""
+                SELECT product_id, vector_data
+                FROM product_vectors
+                WHERE product_id IN ({placeholders})
+            """, batch_ids).fetchall()
+            
+            for row in result:
+                vectors[row[0]] = pickle.loads(row[1])
+        
+        return vectors
+    
+    def get_all_product_ids_with_vectors(self) -> List[int]:
+        """Get all product IDs that have vectors stored"""
+        result = self.conn.execute("SELECT product_id FROM product_vectors ORDER BY product_id").fetchall()
+        return [row[0] for row in result]
+    
+    def get_vector_dimension(self) -> Optional[int]:
+        """Get the dimension of stored vectors (assumes all vectors have same dimension)"""
+        result = self.conn.execute("SELECT vector_dim FROM product_vectors LIMIT 1").fetchone()
+        return result[0] if result else None
+    
+    def save_ann_index_path(self, index_path: str) -> None:
+        """Save path to ANN index file"""
+        self.conn.execute("""
+            INSERT OR REPLACE INTO model_metadata (key, value)
+            VALUES ('ann_index_path', ?)
+        """, [index_path])
+        self.conn.commit()
+    
+    def get_ann_index_path(self) -> Optional[str]:
+        """Get path to ANN index file"""
+        result = self.conn.execute("""
+            SELECT value FROM model_metadata WHERE key = 'ann_index_path'
+        """).fetchone()
+        return result[0] if result else None
+    
+    def save_tfidf_vectorizer(self, vectorizer: Any) -> None:
+        """Save TF-IDF vectorizer to metadata"""
+        vectorizer_data = pickle.dumps(vectorizer)
+        self.conn.execute("""
+            INSERT OR REPLACE INTO model_metadata (key, value)
+            VALUES ('tfidf_vectorizer', ?)
+        """, [vectorizer_data])
+        self.conn.commit()
+    
+    def load_tfidf_vectorizer(self) -> Optional[Any]:
+        """Load TF-IDF vectorizer from metadata"""
+        result = self.conn.execute("""
+            SELECT value FROM model_metadata WHERE key = 'tfidf_vectorizer'
+        """).fetchone()
+        if result:
+            return pickle.loads(result[0])
+        return None
+    
     def get_product_similarities_path(self) -> Optional[str]:
         """Get path to saved product similarities sparse matrix"""
         result = self.conn.execute("""
@@ -426,15 +645,46 @@ class ModelStorage:
         self.conn.execute("DELETE FROM product_index_mapping")
         self.conn.execute("DELETE FROM user_profiles")
         self.conn.execute("DELETE FROM product_features")
+        self.conn.execute("DELETE FROM product_vectors")
         self.conn.execute("DELETE FROM model_metadata")
         self.conn.commit()
         logger.info("All model data cleared")
     
     def close(self) -> None:
         """Close database connection"""
+        # Only close if it's not in the connection pool (i.e., it's a read-only connection)
         if self.conn:
-            self.conn.close()
+            with _connection_lock:
+                # Check if this connection is in the pool
+                if self.db_path in _connection_pool and _connection_pool[self.db_path] is self.conn:
+                    # Don't close pooled connections, they're shared
+                    pass
+                else:
+                    # Close read-only or non-pooled connections
+                    try:
+                        self.conn.close()
+                    except:
+                        pass
             self.conn = None
+    
+    def _execute(self, query: str, params: Optional[List] = None, read_only: Optional[bool] = None) -> Any:
+        """
+        Execute a query with proper connection management
+        
+        Args:
+            query: SQL query
+            params: Query parameters
+            read_only: Whether this is a read-only operation
+        """
+        if read_only is None:
+            read_only = self.read_only or query.strip().upper().startswith(('SELECT', 'WITH'))
+        
+        conn = self._get_connection(read_only=read_only)
+        
+        if params:
+            return conn.execute(query, params)
+        else:
+            return conn.execute(query)
     
     def __enter__(self):
         return self

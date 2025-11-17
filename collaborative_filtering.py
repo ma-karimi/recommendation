@@ -8,7 +8,6 @@ import math
 import json
 from multiprocessing import Pool, cpu_count
 from functools import partial
-import polars as pl
 
 from models import User, Product, ProductInteraction, Recommendation
 from object_loader import load_user_purchase_history
@@ -120,130 +119,6 @@ class CollaborativeFiltering:
             self._calculate_similarities_sequential(n_users)
         
         logger.info("User similarities calculated successfully!")
-    
-    def _load_user_item_matrix_from_storage(self) -> None:
-        """Load user-item matrix from DuckDB storage"""
-        if not self.storage or not self.use_storage:
-            raise ValueError("Storage not available")
-        
-        logger.info("Loading user-item matrix from DuckDB...")
-        n_users = len(self.user_to_index)
-        n_products = len(self.product_to_index)
-        
-        # Load all user-item data from storage
-        all_user_ids = list(self.user_to_index.keys())
-        matrix_data = {}
-        
-        # Load in chunks to avoid memory issues
-        chunk_size = 1000
-        for i in range(0, len(all_user_ids), chunk_size):
-            chunk_user_ids = all_user_ids[i:i + chunk_size]
-            result = self.storage.conn.execute("""
-                SELECT user_id, product_id, score
-                FROM user_item_matrix
-                WHERE user_id IN ({})
-            """.format(','.join(map(str, chunk_user_ids)))).fetchall()
-            
-            for user_id, product_id, score in result:
-                if user_id not in matrix_data:
-                    matrix_data[user_id] = {}
-                matrix_data[user_id][product_id] = score
-        
-        # Build matrix
-        self.user_item_matrix = np.zeros((n_users, n_products))
-        for user_id, products in matrix_data.items():
-            if user_id in self.user_to_index:
-                user_idx = self.user_to_index[user_id]
-                for product_id, score in products.items():
-                    if product_id in self.product_to_index:
-                        product_idx = self.product_to_index[product_id]
-                        self.user_item_matrix[user_idx, product_idx] = score
-        
-        logger.info("User-item matrix loaded from DuckDB")
-    
-    def _calculate_similarities_batch_to_db(self, n_users: int, batch_size: int = 1000) -> None:
-        """Calculate similarities in batches and save directly to DuckDB"""
-        logger.info(f"Calculating similarities in batches for {n_users} users...")
-        
-        if not self.storage:
-            raise ValueError("Storage required for batch calculation")
-        
-        # Clear existing similarities
-        self.storage.conn.execute("DELETE FROM user_similarities")
-        
-        similarity_data = []
-        total_pairs = n_users * (n_users - 1) // 2
-        processed = 0
-        
-        # Load user-item matrix in chunks
-        all_user_ids = list(self.user_to_index.keys())
-        
-        for i in range(n_users):
-            user_id_1 = self.index_to_user[i]
-            
-            # Load row i from storage
-            row_i_data = self.storage.conn.execute("""
-                SELECT product_id, score
-                FROM user_item_matrix
-                WHERE user_id = ?
-            """, [user_id_1]).fetchall()
-            
-            row_i_dict = {pid: score for pid, score in row_i_data}
-            row_i_norm = math.sqrt(sum(s * s for s in row_i_dict.values())) if row_i_dict else 0
-            
-            for j in range(i + 1, n_users):
-                user_id_2 = self.index_to_user[j]
-                
-                # Load row j from storage
-                row_j_data = self.storage.conn.execute("""
-                    SELECT product_id, score
-                    FROM user_item_matrix
-                    WHERE user_id = ?
-                """, [user_id_2]).fetchall()
-                
-                row_j_dict = {pid: score for pid, score in row_j_data}
-                row_j_norm = math.sqrt(sum(s * s for s in row_j_dict.values())) if row_j_dict else 0
-                
-                # Calculate cosine similarity
-                if row_i_norm > 0 and row_j_norm > 0:
-                    dot_product = sum(row_i_dict.get(pid, 0) * row_j_dict.get(pid, 0) 
-                                     for pid in set(row_i_dict.keys()) | set(row_j_dict.keys()))
-                    similarity = dot_product / (row_i_norm * row_j_norm)
-                else:
-                    similarity = 0.0
-                
-                if similarity > 0.01:  # Only save meaningful similarities
-                    similarity_data.append({
-                        'user_id_1': user_id_1,
-                        'user_id_2': user_id_2,
-                        'similarity': float(similarity)
-                    })
-                
-                processed += 1
-                if processed % 10000 == 0:
-                    logger.info(f"Processed {processed}/{total_pairs} pairs ({processed*100//total_pairs}%)...")
-                
-                # Save batch to DB
-                if len(similarity_data) >= batch_size:
-                    df = pl.DataFrame(similarity_data)
-                    self.storage.conn.register('temp_sim', df)
-                    self.storage.conn.execute("INSERT INTO user_similarities SELECT * FROM temp_sim")
-                    self.storage.conn.unregister('temp_sim')
-                    similarity_data = []
-                    gc.collect()
-            
-            if (i + 1) % 100 == 0:
-                logger.info(f"Processed {i + 1}/{n_users} users...")
-        
-        # Save remaining similarities
-        if similarity_data:
-            df = pl.DataFrame(similarity_data)
-            self.storage.conn.register('temp_sim', df)
-            self.storage.conn.execute("INSERT INTO user_similarities SELECT * FROM temp_sim")
-            self.storage.conn.unregister('temp_sim')
-        
-        self.storage.conn.commit()
-        logger.info("Similarities calculated and saved to DuckDB")
     
     def _calculate_similarities_sequential(self, n_users: int) -> None:
         """محاسبه sequential شباهت‌ها"""
@@ -600,23 +475,21 @@ def train_collaborative_model(
     interactions: List[ProductInteraction],
     n_jobs: int = -1,
     use_storage: bool = True,
-    save_to_storage: bool = True,
-    batch_size: int = 10000
+    save_to_storage: bool = True
 ) -> CollaborativeFiltering:
     """
-    آموزش مدل collaborative filtering با استفاده از DuckDB برای مدیریت حافظه
+    آموزش مدل collaborative filtering (با پشتیبانی از multiprocessing و DuckDB storage)
     
     Args:
         interactions: لیست تعاملات کاربر-محصول
         n_jobs: تعداد هسته CPU برای استفاده (-1 = همه هسته‌ها، 1 = sequential)
         use_storage: If True, use DuckDB storage for inference (saves memory)
         save_to_storage: If True, save trained model to DuckDB after training
-        batch_size: اندازه batch برای پردازش تعاملات
     
     Returns:
         CollaborativeFiltering model
     """
-    logger.info("Training Collaborative Filtering model with DuckDB storage...")
+    logger.info("Training Collaborative Filtering model...")
     
     # تعیین تعداد هسته‌ها
     if n_jobs == -1:
@@ -625,95 +498,41 @@ def train_collaborative_model(
         n_jobs = 1
 
     print(f"Using {n_jobs} CPU core(s) for training...")
+
     logger.info(f"Using {n_jobs} CPU core(s) for training...")
     
-    # Create storage - always use it for memory efficiency
-    storage = ModelStorage()
+    # Create storage if needed
+    storage = None
+    if use_storage or save_to_storage:
+        storage = ModelStorage()
     
-    # Step 1: Store interactions in DuckDB in batches (memory-efficient)
-    logger.info(f"Storing {len(interactions)} interactions in DuckDB...")
-    storage.clear_interactions()  # Clear any old data
+    model = CollaborativeFiltering(n_jobs=n_jobs, use_storage=use_storage, storage=storage)
     
-    # Process interactions in batches to avoid memory issues
-    batch_data = []
-    for i, interaction in enumerate(interactions):
-        # Calculate score based on interaction type (same logic as build_user_item_matrix)
-        if interaction.interaction_type == 'purchase':
-            score = 5.0 + (interaction.value / 100) if interaction.value else 5.0
-        elif interaction.interaction_type == 'view':
-            score = 1.0
-        elif interaction.interaction_type == 'cart_add':
-            score = 3.0
-        elif interaction.interaction_type == 'wishlist':
-            score = 4.0
-        else:
-            score = 1.0
-        
-        batch_data.append({
-            'user_id': interaction.user_id,
-            'product_id': interaction.product_id,
-            'interaction_type': interaction.interaction_type,
-            'score': float(score),
-            'timestamp': interaction.timestamp.isoformat() if interaction.timestamp else None,
-            'value': float(interaction.value) if interaction.value else 0.0
-        })
-        
-        # Save batch when it reaches batch_size
-        if len(batch_data) >= batch_size:
-            storage.save_interactions_batch(batch_data)
-            batch_data = []
-            if (i + 1) % (batch_size * 10) == 0:
-                logger.info(f"Stored {i + 1}/{len(interactions)} interactions...")
+    logger.info("Building user-item matrix...")
+    model.build_user_item_matrix(interactions)
     
-    # Save remaining batch
-    if batch_data:
-        storage.save_interactions_batch(batch_data)
-    
-    logger.info(f"All interactions stored in DuckDB. Total: {storage.get_interactions_count()}")
-    
-    # Step 2: Build user-item matrix from DuckDB (memory-efficient)
-    logger.info("Building user-item matrix from DuckDB...")
-    user_to_index, product_to_index, index_to_user, index_to_product = storage.build_user_item_matrix_from_db()
-    
-    # Create model with storage
-    model = CollaborativeFiltering(n_jobs=n_jobs, use_storage=True, storage=storage)
-    model.user_to_index = user_to_index
-    model.product_to_index = product_to_index
-    model.index_to_user = index_to_user
-    model.index_to_product = index_to_product
-    
-    # Step 3: Calculate similarities (this will still use memory but we'll save to DB immediately)
     logger.info("Calculating user similarities...")
-    # Load user-item matrix in chunks for similarity calculation
-    n_users = len(user_to_index)
-    n_products = len(product_to_index)
+    model.calculate_user_similarities()
     
-    # For very large datasets, we'll calculate similarities in batches and save directly to DB
-    if n_users > 5000:  # For large datasets, use batch similarity calculation
-        logger.info(f"Large dataset detected ({n_users} users). Using batch similarity calculation...")
-        model._calculate_similarities_batch_to_db(n_users, batch_size=1000)
-    else:
-        # For smaller datasets, load matrix and calculate normally
-        logger.info("Loading user-item matrix for similarity calculation...")
-        model._load_user_item_matrix_from_storage()
-        model.calculate_user_similarities()
+    # Save to storage if requested
+    if save_to_storage and storage:
+        logger.info("Saving model to DuckDB storage...")
+        storage.save_collaborative_model(
+            model.user_item_matrix,
+            model.user_similarities,
+            model.user_to_index,
+            model.product_to_index,
+            model.index_to_user,
+            model.index_to_product
+        )
         
-        # Save similarities to storage
-        if save_to_storage:
-            logger.info("Saving similarities to DuckDB...")
-            storage._save_similarities_batch(model.user_similarities, index_to_user)
-    
-    # Save mappings to storage
-    if save_to_storage:
-        logger.info("Saving index mappings to DuckDB...")
-        storage._save_mappings(user_to_index, product_to_index, index_to_user, index_to_product)
-        
-        # Clear matrices from memory
-        logger.info("Clearing large matrices from memory...")
-        model.user_item_matrix = None
-        model.user_similarities = None
-        gc.collect()
-        logger.info("Memory cleared. Model will use DuckDB storage for inference.")
+        # Clear large matrices from memory if using storage
+        if use_storage:
+            logger.info("Clearing large matrices from memory...")
+            model.user_item_matrix = None
+            model.user_similarities = None
+            gc.collect()
+            logger.info("Memory cleared. Model will use DuckDB storage for inference.")
     
     logger.info("Collaborative Filtering model trained successfully!")
     return model

@@ -363,12 +363,7 @@ def main(sample_size: int = None):
     print("\n🧠 آموزش سیستم توصیه...")
     print("   این ممکن است چند دقیقه طول بکشد...")
     
-    # Create storage instance once and share it to avoid lock conflicts
-    from model_storage import ModelStorage
-    storage = ModelStorage()
-    
-    # Pass storage instance to avoid creating duplicate connections
-    recommender = HybridRecommender(use_storage=True, storage=storage)
+    recommender = HybridRecommender()
     
     # تنظیم داده‌ها به صورت دستی
     recommender.users = users_list
@@ -392,7 +387,7 @@ def main(sample_size: int = None):
         recommender.collaborative_model = train_collaborative_model(interactions)
         
         print("   🔹 آموزش مدل Content-Based Filtering...")
-        recommender.content_model = train_content_based_model(products_list, user_interactions, storage=storage)
+        recommender.content_model = train_content_based_model(products_list, user_interactions)
         
         print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
         
