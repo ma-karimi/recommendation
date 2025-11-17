@@ -14,7 +14,8 @@ from model_storage import ModelStorage
 class HybridRecommender:
     """سیستم توصیه ترکیبی (Hybrid Recommendation System)"""
     
-    def __init__(self, collaborative_weight: float = 0.6, content_weight: float = 0.4, use_storage: bool = True):
+    def __init__(self, collaborative_weight: float = 0.6, content_weight: float = 0.4, 
+                 use_storage: bool = True, storage: Optional[ModelStorage] = None):
         self.collaborative_weight = collaborative_weight
         self.content_weight = content_weight
         self.collaborative_model = None
@@ -23,7 +24,8 @@ class HybridRecommender:
         self.products = []
         self.user_interactions = {}
         self.use_storage = use_storage
-        self.storage = ModelStorage() if use_storage else None
+        # Use provided storage instance or create new one
+        self.storage = storage if storage is not None else (ModelStorage() if use_storage else None)
     
     def train(self, start_date=None, end_date=None) -> None:
         """آموزش مدل‌های توصیه"""

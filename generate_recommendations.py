@@ -363,7 +363,12 @@ def main(sample_size: int = None):
     print("\n🧠 آموزش سیستم توصیه...")
     print("   این ممکن است چند دقیقه طول بکشد...")
     
-    recommender = HybridRecommender()
+    # Create storage instance once and share it to avoid lock conflicts
+    from model_storage import ModelStorage
+    storage = ModelStorage()
+    
+    # Pass storage instance to avoid creating duplicate connections
+    recommender = HybridRecommender(use_storage=True, storage=storage)
     
     # تنظیم داده‌ها به صورت دستی
     recommender.users = users_list
@@ -382,10 +387,6 @@ def main(sample_size: int = None):
     try:
         from collaborative_filtering import train_collaborative_model
         from content_based_filtering import train_content_based_model
-        from model_storage import ModelStorage
-        
-        # Create storage instance for DuckDB operations
-        storage = ModelStorage()
         
         print("   🔹 آموزش مدل Collaborative Filtering...")
         recommender.collaborative_model = train_collaborative_model(interactions)

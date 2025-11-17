@@ -16,7 +16,7 @@ import gc
 import logging
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
 from scipy.sparse import csr_matrix, save_npz, load_npz
 import duckdb
@@ -30,23 +30,45 @@ logger = logging.getLogger(__name__)
 class ModelStorage:
     """Manages storage and retrieval of model data using DuckDB"""
     
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, reuse_connection: Optional['duckdb.DuckDBPyConnection'] = None):
         """
         Args:
             db_path: Path to DuckDB database file. If None, uses default location.
+            reuse_connection: Existing DuckDB connection to reuse (optional).
         """
         cfg = load_config()
         if db_path is None:
             db_path = os.path.join(cfg.output_dir, "model_data.duckdb")
         
         self.db_path = db_path
-        self.conn = None
-        self._ensure_db()
+        
+        # Reuse existing connection if provided
+        if reuse_connection is not None:
+            self.conn = reuse_connection
+            logger.info(f"Reusing existing DuckDB connection for {self.db_path}")
+        else:
+            self.conn = None
+            self._ensure_db()
     
     def _ensure_db(self) -> None:
         """Ensure database file and tables exist"""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.conn = duckdb.connect(self.db_path)
+        
+        # Connect to DuckDB
+        # Note: DuckDB doesn't support concurrent write access by default
+        # Multiple processes cannot write to the same database file simultaneously
+        try:
+            self.conn = duckdb.connect(self.db_path)
+        except Exception as e:
+            # If connection fails due to lock, provide helpful error message
+            if 'lock' in str(e).lower() or 'conflicting' in str(e).lower():
+                logger.error(
+                    f"DuckDB lock conflict on {self.db_path}. "
+                    f"Another process (PID mentioned in error) may be using the database. "
+                    f"Please close other processes or wait for them to finish. "
+                    f"To check: ps -p <PID> or kill <PID> if safe to do so."
+                )
+            raise
         
         # Create tables for collaborative filtering data
         self.conn.execute("""
