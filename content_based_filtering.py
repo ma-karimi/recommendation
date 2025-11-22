@@ -83,44 +83,64 @@ class ContentBasedFiltering:
     
     def build_tfidf_vectors(self, product_features: Dict[int, Dict]) -> None:
         """
-        ساخت بردارهای TF-IDF و ذخیره در DuckDB (بدون ساخت ماتریس کامل)
+        ساخت بردارهای TF-IDF و ذخیره در DuckDB به صورت batch (بدون ساخت ماتریس کامل)
         """
         product_ids = list(product_features.keys())
         n_products = len(product_ids)
         
-        logger.info(f"Building TF-IDF vectors for {n_products} products...")
+        logger.info(f"Building TF-IDF vectors for {n_products} products (batch processing)...")
         
         # استخراج متن برای TF-IDF
         texts = [product_features[pid]['text'] for pid in product_ids]
         
-        # محاسبه TF-IDF
+        # محاسبه TF-IDF - فقط fit برای یادگیری vocabulary
+        logger.info("Fitting TF-IDF vectorizer...")
         self.vectorizer = TfidfVectorizer(
             max_features=1000,
             stop_words=None,  # برای فارسی
             ngram_range=(1, 2)
         )
+        self.vectorizer.fit(texts)  # فقط fit، نه transform
         
-        # Transform به صورت batch برای صرفه‌جویی در حافظه
-        logger.info("Computing TF-IDF vectors...")
-        tfidf_matrix = self.vectorizer.fit_transform(texts)
+        # ذخیره بعد بردار
+        self.vector_dim = len(self.vectorizer.vocabulary_)
         
-        # ذخیره بردارها در DuckDB به صورت batch
-        logger.info("Saving TF-IDF vectors to DuckDB...")
-        product_vectors = {}
+        # Process و ذخیره به صورت batch برای صرفه‌جویی در حافظه
+        logger.info("Computing and saving TF-IDF vectors in batches...")
+        batch_size = 1000
+        n_batches = (n_products + batch_size - 1) // batch_size
         
-        # تبدیل sparse matrix به dict و نرمال‌سازی برای cosine similarity
         from sklearn.preprocessing import normalize
-        # نرمال‌سازی تمام بردارها (برای cosine similarity)
-        tfidf_matrix_normalized = normalize(tfidf_matrix, norm='l2')
         
-        for i, product_id in enumerate(product_ids):
-            # استخراج بردار برای هر محصول (بدون ساخت ماتریس کامل)
-            vector = tfidf_matrix_normalized[i:i+1]  # Get single row as sparse matrix
-            product_vectors[product_id] = vector
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_products)
+            batch_ids = product_ids[start_idx:end_idx]
+            batch_texts = texts[start_idx:end_idx]
+            
+            # Transform فقط batch فعلی
+            batch_matrix = self.vectorizer.transform(batch_texts)
+            batch_matrix_normalized = normalize(batch_matrix, norm='l2')
+            
+            # تبدیل به dict و ذخیره
+            product_vectors = {}
+            for i, product_id in enumerate(batch_ids):
+                vector = batch_matrix_normalized[i:i+1]
+                product_vectors[product_id] = vector
+            
+            # ذخیره در DuckDB
+            if self.storage:
+                self.storage.save_product_vectors_batch(product_vectors)
+            
+            # پاک کردن از حافظه
+            del batch_matrix, batch_matrix_normalized, product_vectors
+            gc.collect()
+            
+            if (batch_idx + 1) % 10 == 0:
+                logger.info(f"Processed {batch_idx + 1}/{n_batches} batches")
         
-        # ذخیره در DuckDB
+        # ذخیره vectorizer
         if self.storage:
-            self.storage.save_product_vectors_batch(product_vectors)
             self.storage.save_tfidf_vectorizer(self.vectorizer)
             
             # ذخیره نگاشت
@@ -131,20 +151,14 @@ class ContentBasedFiltering:
             if product_mapping_data:
                 import polars as pl
                 df = pl.DataFrame(product_mapping_data)
-                self.storage.conn.execute("DELETE FROM product_index_mapping")
-                self.storage.conn.execute("INSERT INTO product_index_mapping SELECT * FROM df")
-                self.storage.conn.commit()
+                conn = self.storage._get_connection(read_only=False)
+                conn.execute("DELETE FROM product_index_mapping")
+                conn.execute("INSERT INTO product_index_mapping SELECT * FROM df")
+                conn.commit()
         
-        # ذخیره نگاشت در حافظه
+        # ذخیره نگاشت در حافظه (فقط برای دسترسی سریع)
         self.product_to_index = {pid: i for i, pid in enumerate(product_ids)}
         self.index_to_product = {i: pid for pid, i in self.product_to_index.items()}
-        
-        # ذخیره بعد بردار
-        self.vector_dim = tfidf_matrix.shape[1]
-        
-        # پاک کردن ماتریس از حافظه
-        del tfidf_matrix
-        gc.collect()
         
         logger.info(f"TF-IDF vectors saved. Vector dimension: {self.vector_dim}")
     

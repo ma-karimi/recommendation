@@ -194,24 +194,24 @@ class HybridRecommender:
         
         # این بخش فقط برای backward compatibility با کد قدیمی
         if hasattr(self.content_model, 'product_similarities') and self.content_model.product_similarities is not None:
-            product_idx = self.content_model.product_to_index[product_id]
-            
-            # بررسی نوع ماتریس
-            if hasattr(self.content_model.product_similarities, 'toarray'):
-                # Sparse Matrix
-                similarities = self.content_model.product_similarities[product_idx].toarray()[0]
-            else:
-                # Dense Matrix
-                similarities = self.content_model.product_similarities[product_idx]
-            
-            similar_products = []
-            for similar_idx, similarity in enumerate(similarities):
-                if similar_idx != product_idx and similarity > 0.1:
-                    similar_product_id = self.content_model.index_to_product[similar_idx]
-                    similar_products.append((similar_product_id, float(similarity)))
-            
-            similar_products.sort(key=lambda x: x[1], reverse=True)
-            return similar_products[:top_k]
+        product_idx = self.content_model.product_to_index[product_id]
+        
+        # بررسی نوع ماتریس
+        if hasattr(self.content_model.product_similarities, 'toarray'):
+            # Sparse Matrix
+            similarities = self.content_model.product_similarities[product_idx].toarray()[0]
+        else:
+            # Dense Matrix
+            similarities = self.content_model.product_similarities[product_idx]
+        
+        similar_products = []
+        for similar_idx, similarity in enumerate(similarities):
+            if similar_idx != product_idx and similarity > 0.1:
+                similar_product_id = self.content_model.index_to_product[similar_idx]
+                similar_products.append((similar_product_id, float(similarity)))
+        
+        similar_products.sort(key=lambda x: x[1], reverse=True)
+        return similar_products[:top_k]
         
         return []
     

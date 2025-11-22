@@ -514,8 +514,28 @@ def train_collaborative_model(
     logger.info("Calculating user similarities...")
     model.calculate_user_similarities()
     
-    # Save to storage if requested
-    if save_to_storage and storage:
+    # Save to storage if requested and clear from memory
+    if save_to_storage and model.storage:
+        logger.info("Saving model to DuckDB storage...")
+        model.storage.save_collaborative_model(
+            user_item_matrix=model.user_item_matrix,
+            user_similarities=model.user_similarities,
+            user_to_index=model.user_to_index,
+            product_to_index=model.product_to_index,
+            index_to_user=model.index_to_user,
+            index_to_product=model.index_to_product
+        )
+        
+        # Clear matrices from memory after saving
+        logger.info("Clearing matrices from memory...")
+        del model.user_item_matrix
+        del model.user_similarities
+        model.user_item_matrix = None
+        model.user_similarities = None
+        gc.collect()
+        logger.info("Model saved to storage and cleared from memory")
+    
+    return model save_to_storage and storage:
         logger.info("Saving model to DuckDB storage...")
         storage.save_collaborative_model(
             model.user_item_matrix,

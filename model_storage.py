@@ -662,7 +662,7 @@ class ModelStorage:
                 else:
                     # Close read-only or non-pooled connections
                     try:
-                        self.conn.close()
+            self.conn.close()
                     except:
                         pass
             self.conn = None

@@ -14,6 +14,7 @@ import datetime as dt
 import glob
 import logging
 import os
+import gc
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict
@@ -21,6 +22,12 @@ from typing import List, Dict
 import numpy as np
 import polars as pl
 from sqlalchemy import text
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 from dataframe_loader import get_engine, load_order_items
 from hybrid_recommender import HybridRecommender
@@ -265,6 +272,24 @@ def print_sample_recommendations(recommendations_df: pl.DataFrame, products_df: 
         print()
 
 
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB"""
+    if not PSUTIL_AVAILABLE:
+        return 0.0
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except:
+        return 0.0
+
+def log_memory_usage(stage: str):
+    """Log memory usage at a specific stage"""
+    if PSUTIL_AVAILABLE:
+        mem_mb = get_memory_usage_mb()
+        print(f"   💾 استفاده از حافظه ({stage}): {mem_mb:.1f} MB")
+        return mem_mb
+    return 0.0
+
 def main(sample_size: int = None):
     """
     تابع اصلی
@@ -285,11 +310,13 @@ def main(sample_size: int = None):
     
     # 1. بارگذاری کاربران
     print("📥 بارگذاری کاربران از دیتابیس...")
+    initial_memory = log_memory_usage("شروع")
     users_df = load_users_from_db()
     if users_df.is_empty():
         print("❌ هیچ کاربری یافت نشد!")
         return
     print(f"✅ {len(users_df)} کاربر بارگذاری شد")
+    log_memory_usage("بعد از بارگذاری کاربران")
     
     # 2. بارگذاری محصولات
     print("\n📥 بارگذاری محصولات از دیتابیس...")
@@ -298,6 +325,7 @@ def main(sample_size: int = None):
         print("❌ هیچ محصولی یافت نشد!")
         return
     print(f"✅ {len(products_df)} محصول بارگذاری شد")
+    log_memory_usage("بعد از بارگذاری محصولات")
     
     # 3. بارگذاری سفارشات (آخر 180 روز)
     print("\n📥 بارگذاری سفارشات از دیتابیس...")
@@ -331,33 +359,63 @@ def main(sample_size: int = None):
     print("\n📥 بارگذاری داده‌های محبوبیت از Matomo...")
     matomo_popularity = load_matomo_product_popularity()
     
-    # 6. تبدیل داده‌ها به فرمت مدل‌ها
+    # 6. تبدیل داده‌ها به فرمت مدل‌ها (به صورت lazy برای صرفه‌جویی در حافظه)
     print("\n🔄 تبدیل داده‌ها به فرمت مدل‌ها...")
-    users_list = []
+    
+    # فقط محصولات مورد نیاز را بارگذاری می‌کنیم (نه همه)
+    # برای content-based فقط محصولاتی که در تعاملات هستند
+    products_in_interactions = set()
+    for interaction in interactions:
+        products_in_interactions.add(interaction.product_id)
+    
+    print(f"   تعداد محصولات منحصر به فرد در تعاملات: {len(products_in_interactions)}")
+    
+    # فقط محصولات مرتبط را بارگذاری می‌کنیم
+    products_list = []
+    products_dict = {}  # برای دسترسی سریع
+    for row in products_df.iter_rows(named=True):
+        product_id = row['id']
+        if product_id in products_in_interactions:
+            from models import Product
+            product = Product(
+                id=product_id,
+                title=row['title'],
+                slug=row['slug'],
+                sku=row['sku'],
+                sale_price=float(row['sale_price'] or 0),
+                stock_quantity=int(row['stock_quantity'] or 0),
+                status='published' if row['status'] == 1 else 'draft',
+                published_at=row.get('published_at'),
+                seller_id=row.get('seller_id'),
+                category_id=row.get('category_id')
+            )
+            products_list.append(product)
+            products_dict[product_id] = product
+    
+    # پاک کردن DataFrame از حافظه
+    del products_df
+    import gc
+    gc.collect()
+    
+    print(f"   ✅ {len(products_list)} محصول مرتبط بارگذاری شد")
+    
+    # کاربران را به صورت lazy نگه می‌داریم (فقط ID ها)
+    users_dict = {}
     for row in users_df.iter_rows(named=True):
         from models import User
-        users_list.append(User(
+        user = User(
             id=row['id'],
             email=row.get('email'),
             name=row.get('name'),
             created_at=row.get('created_at')
-        ))
+        )
+        users_dict[user.id] = user
     
-    products_list = []
-    for row in products_df.iter_rows(named=True):
-        from models import Product
-        products_list.append(Product(
-            id=row['id'],
-            title=row['title'],
-            slug=row['slug'],
-            sku=row['sku'],
-            sale_price=float(row['sale_price'] or 0),
-            stock_quantity=int(row['stock_quantity'] or 0),
-            status='published' if row['status'] == 1 else 'draft',
-            published_at=row.get('published_at'),
-            seller_id=row.get('seller_id'),
-            category_id=row.get('category_id')
-        ))
+    # پاک کردن DataFrame از حافظه
+    del users_df
+    gc.collect()
+    
+    print(f"   ✅ {len(users_dict)} کاربر بارگذاری شد")
     
     # 7. آموزش سیستم توصیه
     print("\n🧠 آموزش سیستم توصیه...")
@@ -365,8 +423,8 @@ def main(sample_size: int = None):
     
     recommender = HybridRecommender()
     
-    # تنظیم داده‌ها به صورت دستی
-    recommender.users = users_list
+    # تنظیم داده‌ها - فقط محصولات و کاربران مرتبط
+    recommender.users = list(users_dict.values())
     recommender.products = products_list
     
     # گروه‌بندی تعاملات بر اساس user_id
@@ -386,10 +444,31 @@ def main(sample_size: int = None):
         print("   🔹 آموزش مدل Collaborative Filtering...")
         recommender.collaborative_model = train_collaborative_model(interactions)
         
+        # پاک کردن ماتریس از حافظه بعد از ذخیره
+        if recommender.collaborative_model and recommender.collaborative_model.use_storage:
+            if recommender.collaborative_model.user_item_matrix is not None:
+                del recommender.collaborative_model.user_item_matrix
+            if recommender.collaborative_model.user_similarities is not None:
+                del recommender.collaborative_model.user_similarities
+            gc.collect()
+            print("   ✅ ماتریس‌ها در DuckDB ذخیره شد و از حافظه پاک شد")
+        
         print("   🔹 آموزش مدل Content-Based Filtering...")
         recommender.content_model = train_content_based_model(products_list, user_interactions)
         
+        # پاک کردن داده‌های موقت از حافظه
+        if recommender.content_model:
+            # Product features در storage ذخیره شده، از حافظه پاک می‌کنیم
+            if hasattr(recommender.content_model, 'product_features'):
+                del recommender.content_model.product_features
+            gc.collect()
+        
         print("✅ سیستم توصیه با موفقیت آموزش داده شد!")
+        log_memory_usage("بعد از آموزش")
+        
+        # پاک‌سازی نهایی
+        gc.collect()
+        log_memory_usage("بعد از پاک‌سازی")
         
     except Exception as e:
         print(f"❌ خطا در آموزش مدل: {e}")
