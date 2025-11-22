@@ -160,15 +160,18 @@ class CollaborativeFiltering:
                     })
                     total_pairs += 1
                 
-                # ذخیره batch در DuckDB (استفاده از batch insert برای کارایی بهتر)
+                # ذخیره batch در DuckDB (استفاده از VALUES چندتایی)
                 if len(similarity_data) >= 10000:
-                    # استفاده از batch insert با VALUES
-                    values = [(item['user_id_1'], item['user_id_2'], item['similarity']) for item in similarity_data]
-                    conn.executemany("""
+                    # ساخت query با VALUES چندتایی
+                    values_str = ', '.join([
+                        f"({item['user_id_1']}, {item['user_id_2']}, {item['similarity']})"
+                        for item in similarity_data
+                    ])
+                    conn.execute(f"""
                         INSERT OR REPLACE INTO user_similarities 
                         (user_id_1, user_id_2, similarity) 
-                        VALUES (?, ?, ?)
-                    """, values)
+                        VALUES {values_str}
+                    """)
                     similarity_data = []
                     gc.collect()
             
@@ -178,13 +181,16 @@ class CollaborativeFiltering:
         
         # ذخیره باقی‌مانده
         if similarity_data:
-            # استفاده از batch insert
-            values = [(item['user_id_1'], item['user_id_2'], item['similarity']) for item in similarity_data]
-            conn.executemany("""
+            # استفاده از VALUES چندتایی
+            values_str = ', '.join([
+                f"({item['user_id_1']}, {item['user_id_2']}, {item['similarity']})"
+                for item in similarity_data
+            ])
+            conn.execute(f"""
                 INSERT OR REPLACE INTO user_similarities 
                 (user_id_1, user_id_2, similarity) 
-                VALUES (?, ?, ?)
-            """, values)
+                VALUES {values_str}
+            """)
         
         conn.commit()
         logger.info(f"Saved {total_pairs} user similarities to DuckDB")
