@@ -66,12 +66,34 @@ class ModelStorage:
         
         # For read-only connections, always create a new connection (DuckDB allows multiple readers)
         if read_only:
-            try:
-                return duckdb.connect(self.db_path, read_only=True)
-            except Exception as e:
-                logger.warning(f"Failed to open read-only connection: {e}, retrying...")
-                time.sleep(0.1)
-                return duckdb.connect(self.db_path, read_only=True)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    return duckdb.connect(self.db_path, read_only=True)
+                except Exception as e:
+                    if "lock" in str(e).lower() and attempt < max_retries - 1:
+                        wait_time = 0.5 * (attempt + 1)
+                        logger.warning(f"Failed to open read-only connection (attempt {attempt + 1}/{max_retries}), retrying in {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        # If read-only also fails, try to extract PID and provide helpful message
+                        error_str = str(e)
+                        pid = None
+                        if "PID" in error_str:
+                            import re
+                            pid_match = re.search(r'PID\s+(\d+)', error_str)
+                            if pid_match:
+                                pid = pid_match.group(1)
+                        
+                        if pid:
+                            raise RuntimeError(
+                                f"Could not open read-only connection to DuckDB.\n"
+                                f"Another process (PID {pid}) is holding a write lock.\n"
+                                f"To fix: kill {pid} or wait for it to finish.\n"
+                                f"Original error: {e}"
+                            ) from e
+                        raise
         
         # For write connections, use connection pooling to prevent multiple write connections
         with _connection_lock:
@@ -152,6 +174,13 @@ class ModelStorage:
                 except Exception as e:
                     if "lock" in str(e).lower():
                         logger.info("Database is locked, assuming tables exist (read-only mode)")
+                        # Try to verify tables exist with read-only connection
+                        try:
+                            test_conn = self._get_connection(read_only=True)
+                            test_conn.execute("SELECT 1 FROM user_item_matrix LIMIT 1")
+                            test_conn.close()
+                        except:
+                            logger.warning("Could not verify tables exist. They may need to be created.")
                     else:
                         raise
             else:
@@ -163,9 +192,29 @@ class ModelStorage:
         except Exception as e:
             if "lock" in str(e).lower() or "conflicting" in str(e).lower():
                 # If we can't get write lock, try read-only
-                logger.warning(f"Could not get write lock, trying read-only mode: {e}")
+                logger.warning(f"Could not get write lock, falling back to read-only mode: {e}")
+                logger.warning("Some operations may fail. Consider killing the conflicting process.")
                 self.read_only = True
-                self.conn = self._get_connection(read_only=True)
+                try:
+                    self.conn = self._get_connection(read_only=True)
+                except Exception as read_error:
+                    # Even read-only failed, provide helpful error
+                    error_str = str(read_error)
+                    pid = None
+                    if "PID" in error_str:
+                        import re
+                        pid_match = re.search(r'PID\s+(\d+)', error_str)
+                        if pid_match:
+                            pid = pid_match.group(1)
+                    
+                    if pid:
+                        raise RuntimeError(
+                            f"Cannot access DuckDB database. Process {pid} is holding a lock.\n"
+                            f"Run: kill {pid}\n"
+                            f"Or use: python check_db_lock.py --kill-pid {pid}\n"
+                            f"Original error: {read_error}"
+                        ) from read_error
+                    raise
             else:
                 raise
     
