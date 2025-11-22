@@ -194,7 +194,7 @@ class HybridRecommender:
         
         # این بخش فقط برای backward compatibility با کد قدیمی
         if hasattr(self.content_model, 'product_similarities') and self.content_model.product_similarities is not None:
-        product_idx = self.content_model.product_to_index[product_id]
+            product_idx = self.content_model.product_to_index[product_id]
         
         # بررسی نوع ماتریس
         if hasattr(self.content_model.product_similarities, 'toarray'):
