@@ -88,37 +88,101 @@ class CollaborativeFiltering:
     
     def calculate_user_similarities(self) -> None:
         """
-        محاسبه شباهت بین کاربران (با پشتیبانی از multiprocessing)
+        محاسبه شباهت بین کاربران و ذخیره مستقیم در DuckDB (بدون ساخت ماتریس کامل)
         
-        این متد شباهت کسینوسی بین همه جفت کاربران را محاسبه می‌کند
+        این متد شباهت کسینوسی بین همه جفت کاربران را محاسبه می‌کند و مستقیماً در storage ذخیره می‌کند
         """
         n_users = self.user_item_matrix.shape[0]
-        self.user_similarities = np.zeros((n_users, n_users))
         
-        logger.info(f"Calculating user similarities for {n_users} users...")
+        logger.info(f"Calculating user similarities for {n_users} users (streaming to DuckDB)...")
         
-        # تعیین تعداد هسته‌ها
-        if self.n_jobs == -1:
-            n_jobs = cpu_count()
-        elif self.n_jobs <= 0:
-            n_jobs = 1
+        # اگر storage داریم، مستقیماً در DuckDB ذخیره می‌کنیم (بدون ساخت ماتریس کامل)
+        if self.use_storage and self.storage:
+            self._calculate_and_save_similarities_streaming(n_users)
         else:
-            n_jobs = self.n_jobs
-        
-        logger.info(f"Using {n_jobs} CPU core(s) for similarity calculation...")
-        
-        if n_jobs > 1 and n_users > 100:
-            # پردازش موازی
-            try:
-                self._calculate_similarities_parallel(n_jobs, n_users)
-            except Exception as e:
-                logger.warning(f"Parallel calculation failed, falling back to sequential: {e}")
+            # Fallback: ساخت ماتریس کامل (فقط اگر storage نداریم)
+            logger.warning("No storage available, creating full similarity matrix in memory")
+            self.user_similarities = np.zeros((n_users, n_users))
+            
+            # تعیین تعداد هسته‌ها
+            if self.n_jobs == -1:
+                n_jobs = cpu_count()
+            elif self.n_jobs <= 0:
+                n_jobs = 1
+            else:
+                n_jobs = self.n_jobs
+            
+            logger.info(f"Using {n_jobs} CPU core(s) for similarity calculation...")
+            
+            if n_jobs > 1 and n_users > 100:
+                # پردازش موازی
+                try:
+                    self._calculate_similarities_parallel(n_jobs, n_users)
+                except Exception as e:
+                    logger.warning(f"Parallel calculation failed, falling back to sequential: {e}")
+                    self._calculate_similarities_sequential(n_users)
+            else:
+                # پردازش sequential
                 self._calculate_similarities_sequential(n_users)
-        else:
-            # پردازش sequential
-            self._calculate_similarities_sequential(n_users)
         
         logger.info("User similarities calculated successfully!")
+    
+    def _calculate_and_save_similarities_streaming(self, n_users: int) -> None:
+        """محاسبه و ذخیره شباهت‌ها به صورت streaming در DuckDB (بدون ساخت ماتریس کامل)"""
+        logger.info("Calculating similarities and saving directly to DuckDB (no full matrix)...")
+        
+        # پاک کردن شباهت‌های قبلی
+        conn = self.storage._get_connection(read_only=False)
+        conn.execute("DELETE FROM user_similarities")
+        
+        # محاسبه و ذخیره به صورت batch
+        batch_size = 100  # تعداد کاربران در هر batch
+        similarity_data = []
+        total_pairs = 0
+        
+        for i in range(n_users):
+            user_id_1 = self.index_to_user[i]
+            user_vector_1 = self.user_item_matrix[i]
+            
+            # محاسبه شباهت با کاربران بعدی (فقط upper triangle)
+            for j in range(i, n_users):
+                user_id_2 = self.index_to_user[j]
+                user_vector_2 = self.user_item_matrix[j]
+                
+                similarity = _cosine_similarity_helper(user_vector_1, user_vector_2)
+                
+                # فقط شباهت‌های معنی‌دار را ذخیره می‌کنیم
+                if similarity > 0.01:
+                    similarity_data.append({
+                        'user_id_1': user_id_1,
+                        'user_id_2': user_id_2,
+                        'similarity': float(similarity)
+                    })
+                    total_pairs += 1
+                
+                # ذخیره batch در DuckDB
+                if len(similarity_data) >= 10000:
+                    import polars as pl
+                    df = pl.DataFrame(similarity_data)
+                    conn.execute("INSERT INTO user_similarities SELECT * FROM df")
+                    similarity_data = []
+                    gc.collect()
+            
+            # Progress logging
+            if (i + 1) % 100 == 0:
+                logger.info(f"Processed {i + 1}/{n_users} users ({total_pairs} similarities saved)")
+        
+        # ذخیره باقی‌مانده
+        if similarity_data:
+            import polars as pl
+            df = pl.DataFrame(similarity_data)
+            conn.execute("INSERT INTO user_similarities SELECT * FROM df")
+        
+        conn.commit()
+        logger.info(f"Saved {total_pairs} user similarities to DuckDB")
+        
+        # ماتریس شباهت را None می‌کنیم چون در storage ذخیره شده
+        self.user_similarities = None
     
     def _calculate_similarities_sequential(self, n_users: int) -> None:
         """محاسبه sequential شباهت‌ها"""
@@ -514,12 +578,15 @@ def train_collaborative_model(
     logger.info("Calculating user similarities...")
     model.calculate_user_similarities()
     
-    # Save to storage if requested and clear from memory
+    # Save user-item matrix to storage and clear from memory
+    # Note: user_similarities already saved in calculate_user_similarities() if using storage
     if save_to_storage and model.storage:
-        logger.info("Saving model to DuckDB storage...")
+        logger.info("Saving user-item matrix to DuckDB storage...")
+        # شباهت‌ها قبلاً در calculate_user_similarities ذخیره شدند (اگر use_storage=True)
+        # فقط user-item matrix را ذخیره می‌کنیم
         model.storage.save_collaborative_model(
             user_item_matrix=model.user_item_matrix,
-            user_similarities=model.user_similarities,
+            user_similarities=model.user_similarities if model.user_similarities is not None else np.zeros((0, 0)),
             user_to_index=model.user_to_index,
             product_to_index=model.product_to_index,
             index_to_user=model.index_to_user,
@@ -529,9 +596,10 @@ def train_collaborative_model(
         # Clear matrices from memory after saving
         logger.info("Clearing matrices from memory...")
         del model.user_item_matrix
-        del model.user_similarities
         model.user_item_matrix = None
-        model.user_similarities = None
+        if model.user_similarities is not None:
+            del model.user_similarities
+            model.user_similarities = None
         gc.collect()
         logger.info("Model saved to storage and cleared from memory")
     
