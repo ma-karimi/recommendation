@@ -160,11 +160,15 @@ class CollaborativeFiltering:
                     })
                     total_pairs += 1
                 
-                # ذخیره batch در DuckDB
+                # ذخیره batch در DuckDB (استفاده از batch insert برای کارایی بهتر)
                 if len(similarity_data) >= 10000:
-                    import polars as pl
-                    df = pl.DataFrame(similarity_data)
-                    conn.execute("INSERT INTO user_similarities SELECT * FROM df")
+                    # استفاده از batch insert با VALUES
+                    values = [(item['user_id_1'], item['user_id_2'], item['similarity']) for item in similarity_data]
+                    conn.executemany("""
+                        INSERT OR REPLACE INTO user_similarities 
+                        (user_id_1, user_id_2, similarity) 
+                        VALUES (?, ?, ?)
+                    """, values)
                     similarity_data = []
                     gc.collect()
             
@@ -174,9 +178,13 @@ class CollaborativeFiltering:
         
         # ذخیره باقی‌مانده
         if similarity_data:
-            import polars as pl
-            df = pl.DataFrame(similarity_data)
-            conn.execute("INSERT INTO user_similarities SELECT * FROM df")
+            # استفاده از batch insert
+            values = [(item['user_id_1'], item['user_id_2'], item['similarity']) for item in similarity_data]
+            conn.executemany("""
+                INSERT OR REPLACE INTO user_similarities 
+                (user_id_1, user_id_2, similarity) 
+                VALUES (?, ?, ?)
+            """, values)
         
         conn.commit()
         logger.info(f"Saved {total_pairs} user similarities to DuckDB")
