@@ -44,8 +44,21 @@ def _build_url_from_laravel_env() -> Optional[str]:
     return None
 
 
-def get_engine() -> Engine:
-    """Create SQLAlchemy engine from RECO_DB_URL or Laravel DB_* envs."""
+# Global engine cache
+_engine_cache: Optional[Engine] = None
+
+def get_engine(force_new: bool = False) -> Engine:
+    """
+    Create SQLAlchemy engine from RECO_DB_URL or Laravel DB_* envs.
+    
+    Args:
+        force_new: If True, create a new engine even if one exists (useful for resetting broken connections)
+    """
+    global _engine_cache
+    
+    if _engine_cache is not None and not force_new:
+        return _engine_cache
+    
     cfg = load_config()
     url = (cfg.db.url or "").strip()
     if not url:
@@ -57,8 +70,33 @@ def get_engine() -> Engine:
             "or ensure Laravel DB_* variables are set."
         )
 
-    engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+    # Enhanced connection pool settings for MySQL/PyMySQL
+    engine = create_engine(
+        url,
+        pool_pre_ping=True,  # Verify connections before using
+        pool_recycle=3600,    # Recycle connections after 1 hour
+        pool_size=5,          # Number of connections to maintain
+        max_overflow=10,      # Additional connections allowed
+        echo=False,
+        connect_args={
+            "connect_timeout": 10,
+            "read_timeout": 30,
+            "write_timeout": 30,
+        }
+    )
+    
+    _engine_cache = engine
     return engine
+
+def reset_engine() -> None:
+    """Reset the engine cache (useful when connections are broken)"""
+    global _engine_cache
+    if _engine_cache is not None:
+        try:
+            _engine_cache.dispose()
+        except:
+            pass
+    _engine_cache = None
 
 
 def load_products() -> pl.DataFrame:

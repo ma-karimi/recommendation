@@ -44,43 +44,79 @@ logger = logging.getLogger(__name__)
 
 
 def load_users_from_db() -> pl.DataFrame:
-    """بارگذاری کاربران از دیتابیس به صورت DataFrame"""
-    engine = get_engine()
-    sql = text("""
-        SELECT id, email, 
-               CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, '')) as name,
-               created_at
-        FROM users
-        ORDER BY id
-    """)
+    """بارگذاری کاربران از دیتابیس به صورت DataFrame با retry logic"""
+    from dataframe_loader import get_engine, reset_engine
+    import time
     
-    with engine.connect() as conn:
-        rows = [dict(row) for row in conn.execute(sql).mappings()]
-    
-    if not rows:
-        return pl.DataFrame()
-    
-    return pl.DataFrame(rows)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            engine = get_engine(force_new=(attempt > 0))
+            sql = text("""
+                SELECT id, email, 
+                       CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, '')) as name,
+                       created_at
+                FROM users
+                ORDER BY id
+            """)
+            
+            with engine.connect() as conn:
+                rows = [dict(row) for row in conn.execute(sql).mappings()]
+            
+            if not rows:
+                return pl.DataFrame()
+            
+            return pl.DataFrame(rows)
+        except Exception as e:
+            if "Packet sequence" in str(e) or "InternalError" in str(e):
+                if attempt < max_retries - 1:
+                    logger.warning(f"Database connection error (attempt {attempt + 1}/{max_retries}), resetting connection...")
+                    reset_engine()
+                    time.sleep(1)
+                    continue
+                else:
+                    logger.error(f"Failed to connect after {max_retries} attempts")
+                    raise
+            else:
+                raise
 
 
 def load_products_from_db() -> pl.DataFrame:
-    """بارگذاری محصولات از دیتابیس به صورت DataFrame"""
-    engine = get_engine()
-    sql = text("""
-        SELECT id, title, slug, sku, sale_price, stock_quantity, 
-               status, published_at, seller_id, category_id
-        FROM products
-        WHERE deleted_at IS NULL AND status = 1
-        ORDER BY id
-    """)
+    """بارگذاری محصولات از دیتابیس به صورت DataFrame با retry logic"""
+    from dataframe_loader import get_engine, reset_engine
+    import time
     
-    with engine.connect() as conn:
-        rows = [dict(row) for row in conn.execute(sql).mappings()]
-    
-    if not rows:
-        return pl.DataFrame()
-    
-    return pl.DataFrame(rows)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            engine = get_engine(force_new=(attempt > 0))
+            sql = text("""
+                SELECT id, title, slug, sku, sale_price, stock_quantity, 
+                       status, published_at, seller_id, category_id
+                FROM products
+                WHERE deleted_at IS NULL AND status = 1
+                ORDER BY id
+            """)
+            
+            with engine.connect() as conn:
+                rows = [dict(row) for row in conn.execute(sql).mappings()]
+            
+            if not rows:
+                return pl.DataFrame()
+            
+            return pl.DataFrame(rows)
+        except Exception as e:
+            if "Packet sequence" in str(e) or "InternalError" in str(e):
+                if attempt < max_retries - 1:
+                    logger.warning(f"Database connection error (attempt {attempt + 1}/{max_retries}), resetting connection...")
+                    reset_engine()
+                    time.sleep(1)
+                    continue
+                else:
+                    logger.error(f"Failed to connect after {max_retries} attempts")
+                    raise
+            else:
+                raise
 
 
 def create_user_product_interactions(order_items_df: pl.DataFrame) -> List[ProductInteraction]:
