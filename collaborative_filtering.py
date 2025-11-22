@@ -535,24 +535,5 @@ def train_collaborative_model(
         gc.collect()
         logger.info("Model saved to storage and cleared from memory")
     
-    return model save_to_storage and storage:
-        logger.info("Saving model to DuckDB storage...")
-        storage.save_collaborative_model(
-            model.user_item_matrix,
-            model.user_similarities,
-            model.user_to_index,
-            model.product_to_index,
-            model.index_to_user,
-            model.index_to_product
-        )
-        
-        # Clear large matrices from memory if using storage
-        if use_storage:
-            logger.info("Clearing large matrices from memory...")
-            model.user_item_matrix = None
-            model.user_similarities = None
-            gc.collect()
-            logger.info("Memory cleared. Model will use DuckDB storage for inference.")
-    
     logger.info("Collaborative Filtering model trained successfully!")
     return model
