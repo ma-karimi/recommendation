@@ -428,8 +428,10 @@ def main(sample_size: int = None):
             products_list.append(product)
             products_dict[product_id] = product
     
-    # پاک کردن DataFrame از حافظه
-    del products_df
+    # فیلتر کردن products_df برای فقط محصولاتی که در تعاملات هستند (برای استفاده بعدی)
+    # این باعث صرفه‌جویی در حافظه می‌شود
+    products_df = products_df.filter(pl.col('id').is_in(list(products_in_interactions)))
+    
     import gc
     gc.collect()
     
