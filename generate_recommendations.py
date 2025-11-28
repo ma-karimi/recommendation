@@ -435,6 +435,11 @@ def main(sample_size: int = None):
     
     print(f"   ✅ {len(products_list)} محصول مرتبط بارگذاری شد")
     
+    # گروه‌بندی تعاملات بر اساس user_id (قبل از استفاده در users_df)
+    user_interactions = defaultdict(list)
+    for interaction in interactions:
+        user_interactions[interaction.user_id].append(interaction)
+    
     # کاربران را به صورت lazy نگه می‌داریم (فقط ID ها)
     users_dict = {}
     for row in users_df.iter_rows(named=True):
@@ -447,11 +452,20 @@ def main(sample_size: int = None):
         )
         users_dict[user.id] = user
     
-    # پاک کردن DataFrame از حافظه
-    del users_df
-    gc.collect()
-    
     print(f"   ✅ {len(users_dict)} کاربر بارگذاری شد")
+    
+    # نگه داشتن users_df برای استفاده بعدی در generate_recommendations_for_all_users
+    # اما فقط برای کاربرانی که در تعاملات هستند (برای صرفه‌جویی در حافظه)
+    users_with_interactions = set(user_interactions.keys())
+    if len(users_with_interactions) < len(users_df):
+        # فیلتر کردن users_df برای فقط کاربرانی که تعامل دارند
+        users_df = users_df.filter(pl.col('id').is_in(list(users_with_interactions)))
+        print(f"   ✅ فیلتر شد به {len(users_df)} کاربر با تعامل")
+    
+    # اگر sample_size مشخص شده، فقط همان تعداد را نگه می‌داریم
+    if sample_size and sample_size < len(users_df):
+        users_df = users_df.head(sample_size)
+        print(f"   ✅ محدود شد به {len(users_df)} کاربر (sample_size)")
     
     # 7. آموزش سیستم توصیه
     print("\n🧠 آموزش سیستم توصیه...")
@@ -463,11 +477,7 @@ def main(sample_size: int = None):
     recommender.users = list(users_dict.values())
     recommender.products = products_list
     
-    # گروه‌بندی تعاملات بر اساس user_id
-    user_interactions = defaultdict(list)
-    for interaction in interactions:
-        user_interactions[interaction.user_id].append(interaction)
-    
+    # user_interactions قبلاً ساخته شده
     recommender.user_interactions = dict(user_interactions)
     
     print(f"   تعداد کاربران با تعامل: {len(user_interactions)}")
