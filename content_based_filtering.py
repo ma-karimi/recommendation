@@ -151,7 +151,11 @@ class ContentBasedFiltering:
             if product_mapping_data:
                 import polars as pl
                 df = pl.DataFrame(product_mapping_data)
-                conn = self.storage._get_connection(read_only=False)
+                # استفاده از connection موجود storage
+                if self.storage.conn:
+                    conn = self.storage.conn
+                else:
+                    conn = self.storage._get_connection(read_only=False)
                 conn.execute("DELETE FROM product_index_mapping")
                 conn.execute("INSERT INTO product_index_mapping SELECT * FROM df")
                 conn.commit()
@@ -329,7 +333,13 @@ class ContentBasedFiltering:
             self.index_path = index_path
             
             # بارگذاری نگاشت از product_index_mapping در DuckDB
-            result = self.storage.conn.execute("""
+            # استفاده از connection موجود یا ایجاد جدید
+            if self.storage.conn:
+                conn = self.storage.conn
+            else:
+                conn = self.storage._get_connection(read_only=True)
+            
+            result = conn.execute("""
                 SELECT product_id, product_index 
                 FROM product_index_mapping 
                 ORDER BY product_index

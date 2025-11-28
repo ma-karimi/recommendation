@@ -389,7 +389,15 @@ class ModelStorage:
     
     def load_user_item_row(self, user_id: int) -> Dict[int, float]:
         """Load a single user's item ratings from database"""
-        conn = self._get_connection(read_only=True)
+        # استفاده از connection موجود اگر وجود دارد
+        if self.conn:
+            conn = self.conn
+        else:
+            try:
+                conn = self._get_connection(read_only=True)
+            except Exception:
+                conn = self._get_connection(read_only=False)
+        
         result = conn.execute("""
             SELECT product_id, score
             FROM user_item_matrix
@@ -400,7 +408,15 @@ class ModelStorage:
     
     def load_user_similarities(self, user_id: int, top_k: Optional[int] = None) -> List[Tuple[int, float]]:
         """Load similar users for a given user"""
-        conn = self._get_connection(read_only=True)
+        # استفاده از connection موجود اگر وجود دارد
+        if self.conn:
+            conn = self.conn
+        else:
+            try:
+                conn = self._get_connection(read_only=True)
+            except Exception:
+                conn = self._get_connection(read_only=False)
+        
         query = """
             SELECT user_id_2, similarity
             FROM user_similarities
@@ -578,7 +594,15 @@ class ModelStorage:
     
     def load_product_vector(self, product_id: int) -> Optional[np.ndarray]:
         """Load a single product vector from DuckDB"""
-        conn = self._get_connection(read_only=True)
+        # استفاده از connection موجود اگر وجود دارد
+        if self.conn:
+            conn = self.conn
+        else:
+            try:
+                conn = self._get_connection(read_only=True)
+            except Exception:
+                conn = self._get_connection(read_only=False)
+        
         result = conn.execute("""
             SELECT vector_data FROM product_vectors WHERE product_id = ?
         """, [product_id]).fetchone()
@@ -592,7 +616,19 @@ class ModelStorage:
         if not product_ids:
             return {}
         
-        conn = self._get_connection(read_only=True)
+        # استفاده از connection موجود اگر وجود دارد (برای جلوگیری از conflict)
+        # یا استفاده از write connection که می‌تواند read هم بکند
+        if self.conn:
+            conn = self.conn
+        else:
+            # اگر connection نداریم، سعی می‌کنیم read-only بگیریم
+            # اما اگر write connection وجود دارد، از آن استفاده می‌کنیم
+            try:
+                conn = self._get_connection(read_only=True)
+            except Exception:
+                # اگر read-only fail کرد، از write connection استفاده می‌کنیم
+                conn = self._get_connection(read_only=False)
+        
         vectors = {}
         for i in range(0, len(product_ids), batch_size):
             batch_ids = product_ids[i:i + batch_size]
