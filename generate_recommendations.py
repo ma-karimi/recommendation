@@ -567,6 +567,20 @@ def main(sample_size: int = None):
         print("   ✅ فایل‌ها به درستی ذخیره شدند")
     
     # 10. نمایش نمونه توصیه‌ها
+    # اطمینان از وجود products_df (برای جلوگیری از خطا)
+    try:
+        _ = len(products_df)
+    except (NameError, UnboundLocalError):
+        # اگر products_df وجود ندارد، دوباره بارگذاری می‌کنیم (فقط برای نمایش)
+        print("⚠️  بارگذاری مجدد products_df برای نمایش...")
+        products_df = load_products_from_db()
+        # فیلتر کردن فقط محصولات مرتبط
+        products_in_interactions = set()
+        for interaction in interactions:
+            products_in_interactions.add(interaction.product_id)
+        if products_in_interactions:
+            products_df = products_df.filter(pl.col('id').is_in(list(products_in_interactions)))
+    
     print_sample_recommendations(recommendations_df, products_df, n_users=5)
     
     # 11. آمار نهایی
@@ -575,8 +589,14 @@ def main(sample_size: int = None):
     print(f"{'='*80}")
     print(f"📊 آمار نهایی:")
     print(f"   تعداد کاربران: {len(users_df)}")
-    print(f"   تعداد محصولات: {len(products_df)}")
-    print(f"   تعداد سفارشات: {len(order_items_df)}")
+    try:
+        print(f"   تعداد محصولات: {len(products_df)}")
+    except (NameError, UnboundLocalError):
+        print(f"   تعداد محصولات: N/A")
+    try:
+        print(f"   تعداد سفارشات: {len(order_items_df)}")
+    except (NameError, UnboundLocalError):
+        print(f"   تعداد سفارشات: N/A")
     print(f"   تعداد کل توصیه‌ها: {len(recommendations_df)}")
     print(f"   فایل خروجی: {output_file}")
     print(f"{'='*80}\n")
