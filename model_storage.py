@@ -338,22 +338,48 @@ class ModelStorage:
                 try:
                     self.conn = self._get_connection(read_only=True)
                 except Exception as read_error:
-                    # Even read-only failed, provide helpful error
+                    # Even read-only failed, try to ask user to kill process
                     error_str = str(read_error)
                     pid = None
                     if "PID" in error_str:
-                        import re
                         pid_match = re.search(r'PID\s+(\d+)', error_str)
                         if pid_match:
-                            pid = pid_match.group(1)
+                            pid = int(pid_match.group(1))
                     
                     if pid:
-                        raise RuntimeError(
-                            f"Cannot access DuckDB database. Process {pid} is holding a lock.\n"
-                            f"Run: kill {pid}\n"
-                            f"Or use: python check_db_lock.py --kill-pid {pid}\n"
-                            f"Original error: {read_error}"
-                        ) from read_error
+                        pid_int = pid if isinstance(pid, int) else int(pid)
+                        # Ask user if they want to kill the conflicting process
+                        if _ask_user_to_kill_process(pid_int, self.db_path):
+                            # User confirmed, kill the process
+                            if _kill_process_safely(pid_int):
+                                logger.info(f"Process {pid_int} killed. Retrying connection...")
+                                # Wait a moment for lock to be released
+                                time.sleep(2)
+                                # Retry connection
+                                try:
+                                    self.conn = self._get_connection(read_only=True)
+                                    return
+                                except Exception as retry_error:
+                                    logger.error(f"Still cannot connect after killing process: {retry_error}")
+                                    raise RuntimeError(
+                                        f"Cannot access DuckDB database even after killing process {pid_int}.\n"
+                                        f"Please check if the database file is accessible: {self.db_path}\n"
+                                        f"Original error: {read_error}"
+                                    ) from retry_error
+                            else:
+                                raise RuntimeError(
+                                    f"Failed to kill process {pid_int}.\n"
+                                    f"Please kill it manually: kill {pid_int}\n"
+                                    f"Or use: python check_db_lock.py --kill-pid {pid_int}\n"
+                                    f"Original error: {read_error}"
+                                ) from read_error
+                        else:
+                            raise RuntimeError(
+                                f"Cannot access DuckDB database. Process {pid_int} is holding a lock.\n"
+                                f"Run: kill {pid_int}\n"
+                                f"Or use: python check_db_lock.py --kill-pid {pid_int}\n"
+                                f"Original error: {read_error}"
+                            ) from read_error
                     raise
             else:
                 raise
