@@ -17,6 +17,9 @@ import gc
 import logging
 import pickle
 import time
+import signal
+import sys
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
@@ -32,6 +35,90 @@ logger = logging.getLogger(__name__)
 # Global connection pool to prevent multiple write connections
 _connection_lock = threading.Lock()
 _connection_pool: Dict[str, duckdb.DuckDBPyConnection] = {}
+
+
+def _kill_process_safely(pid: int) -> bool:
+    """
+    Kill a process by PID safely
+    
+    Args:
+        pid: Process ID to kill
+        
+    Returns:
+        True if process was killed successfully, False otherwise
+    """
+    try:
+        # Check if process exists
+        os.kill(pid, 0)  # Signal 0 just checks if process exists
+        
+        # Try graceful termination first
+        logger.info(f"Attempting to terminate process {pid} gracefully...")
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(2)
+        
+        # Check if still running
+        try:
+            os.kill(pid, 0)
+            # Still running, force kill
+            logger.warning(f"Process {pid} still running, forcing termination...")
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+        except ProcessLookupError:
+            # Process terminated successfully
+            logger.info(f"Process {pid} terminated successfully")
+        
+        return True
+    except ProcessLookupError:
+        logger.info(f"Process {pid} does not exist (already terminated)")
+        return True
+    except PermissionError:
+        logger.error(f"Permission denied: Cannot kill process {pid} (may need root/sudo)")
+        return False
+    except Exception as e:
+        logger.error(f"Error killing process {pid}: {e}")
+        return False
+
+
+def _ask_user_to_kill_process(pid: int, db_path: str) -> bool:
+    """
+    Ask user if they want to kill the conflicting process
+    
+    Args:
+        pid: Process ID of conflicting process
+        db_path: Path to database file
+        
+    Returns:
+        True if user confirmed, False otherwise
+    """
+    # Check if stdin is interactive (not a pipe or file)
+    if not sys.stdin.isatty():
+        # Non-interactive mode, don't ask
+        return False
+    
+    print(f"\n{'='*80}")
+    print(f"⚠️  DuckDB Database Lock Detected")
+    print(f"{'='*80}")
+    print(f"Another process (PID {pid}) is holding a lock on the database:")
+    print(f"  {db_path}")
+    print(f"\nOptions:")
+    print(f"  1. Kill the conflicting process (PID {pid}) and continue with new process")
+    print(f"  2. Cancel this process and let the previous one continue")
+    print(f"\nWhat would you like to do?")
+    
+    while True:
+        try:
+            response = input("Enter choice (1/2) or 'y' to kill conflicting process: ").strip().lower()
+            
+            if response in ['1', 'y', 'yes', 'kill']:
+                return True
+            elif response in ['2', 'n', 'no', 'cancel', 'exit', 'q', 'quit']:
+                print("Cancelled by user. Exiting...")
+                sys.exit(0)
+            else:
+                print("Invalid choice. Please enter 1 or 2 (or y/n).")
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled by user. Exiting...")
+            sys.exit(0)
 
 
 class ModelStorage:
@@ -77,22 +164,46 @@ class ModelStorage:
                         time.sleep(wait_time)
                         continue
                     else:
-                        # If read-only also fails, try to extract PID and provide helpful message
+                        # If read-only also fails, try to extract PID and ask user
                         error_str = str(e)
                         pid = None
                         if "PID" in error_str:
-                            import re
                             pid_match = re.search(r'PID\s+(\d+)', error_str)
                             if pid_match:
-                                pid = pid_match.group(1)
+                                pid = int(pid_match.group(1))
                         
                         if pid:
-                            raise RuntimeError(
-                                f"Could not open read-only connection to DuckDB.\n"
-                                f"Another process (PID {pid}) is holding a write lock.\n"
-                                f"To fix: kill {pid} or wait for it to finish.\n"
-                                f"Original error: {e}"
-                            ) from e
+                            # Ask user if they want to kill the conflicting process
+                            if _ask_user_to_kill_process(pid, self.db_path):
+                                # User confirmed, kill the process
+                                if _kill_process_safely(pid):
+                                    logger.info(f"Process {pid} killed. Retrying connection...")
+                                    # Wait a moment for lock to be released
+                                    time.sleep(2)
+                                    # Retry connection one more time
+                                    try:
+                                        return duckdb.connect(self.db_path, read_only=True)
+                                    except Exception as retry_error:
+                                        logger.error(f"Still cannot connect after killing process: {retry_error}")
+                                        raise RuntimeError(
+                                            f"Could not connect to DuckDB even after killing process {pid}.\n"
+                                            f"Please check if the database file is accessible: {self.db_path}\n"
+                                            f"Original error: {e}"
+                                        ) from retry_error
+                                else:
+                                    raise RuntimeError(
+                                        f"Failed to kill process {pid}.\n"
+                                        f"Please kill it manually: kill {pid}\n"
+                                        f"Original error: {e}"
+                                    ) from e
+                            else:
+                                # User chose to cancel
+                                raise RuntimeError(
+                                    f"Could not open read-only connection to DuckDB.\n"
+                                    f"Another process (PID {pid}) is holding a write lock.\n"
+                                    f"To fix: kill {pid} or wait for it to finish.\n"
+                                    f"Original error: {e}"
+                                ) from e
                         raise
         
         # For write connections, use connection pooling to prevent multiple write connections
@@ -132,10 +243,36 @@ class ModelStorage:
                             error_str = str(e)
                             pid = None
                             if "PID" in error_str:
-                                import re
                                 pid_match = re.search(r'PID\s+(\d+)', error_str)
                                 if pid_match:
-                                    pid = pid_match.group(1)
+                                    pid = int(pid_match.group(1))
+                            
+                            # Ask user if they want to kill the conflicting process
+                            if pid:
+                                if _ask_user_to_kill_process(pid, self.db_path):
+                                    # User confirmed, kill the process
+                                    if _kill_process_safely(pid):
+                                        logger.info(f"Process {pid} killed. Retrying connection...")
+                                        # Wait a moment for lock to be released
+                                        time.sleep(2)
+                                        # Retry connection one more time
+                                        try:
+                                            conn = duckdb.connect(self.db_path, read_only=False)
+                                            _connection_pool[self.db_path] = conn
+                                            return conn
+                                        except Exception as retry_error:
+                                            logger.error(f"Still cannot connect after killing process: {retry_error}")
+                                            raise RuntimeError(
+                                                f"Could not connect to DuckDB even after killing process {pid}.\n"
+                                                f"Please check if the database file is accessible: {self.db_path}\n"
+                                                f"Original error: {e}"
+                                            ) from retry_error
+                                    else:
+                                        raise RuntimeError(
+                                            f"Failed to kill process {pid}.\n"
+                                            f"Please kill it manually: kill {pid}\n"
+                                            f"Original error: {e}"
+                                        ) from e
                             
                             error_msg = (
                                 f"Could not acquire DuckDB lock after {self.max_retries} attempts.\n"
@@ -198,22 +335,49 @@ class ModelStorage:
                 try:
                     self.conn = self._get_connection(read_only=True)
                 except Exception as read_error:
-                    # Even read-only failed, provide helpful error
+                    # Even read-only failed, try to ask user to kill process
                     error_str = str(read_error)
                     pid = None
                     if "PID" in error_str:
-                        import re
                         pid_match = re.search(r'PID\s+(\d+)', error_str)
                         if pid_match:
-                            pid = pid_match.group(1)
+                            pid = int(pid_match.group(1))
                     
                     if pid:
-                        raise RuntimeError(
-                            f"Cannot access DuckDB database. Process {pid} is holding a lock.\n"
-                            f"Run: kill {pid}\n"
-                            f"Or use: python check_db_lock.py --kill-pid {pid}\n"
-                            f"Original error: {read_error}"
-                        ) from read_error
+                        pid_int = pid if isinstance(pid, int) else int(pid)
+                        # Ask user if they want to kill the conflicting process
+                        if _ask_user_to_kill_process(pid_int, self.db_path):
+                            # User confirmed, kill the process
+                            if _kill_process_safely(pid_int):
+                                logger.info(f"Process {pid_int} killed. Retrying connection...")
+                                # Wait a moment for lock to be released
+                                time.sleep(2)
+                                # Retry connection
+                                try:
+                                    self.conn = self._get_connection(read_only=True)
+                                    return
+                                except Exception as retry_error:
+                                    logger.error(f"Still cannot connect after killing process: {retry_error}")
+                                    raise RuntimeError(
+                                        f"Cannot access DuckDB database even after killing process {pid_int}.\n"
+                                        f"Please check if the database file is accessible: {self.db_path}\n"
+                                        f"Original error: {read_error}"
+                                    ) from retry_error
+                            else:
+                                raise RuntimeError(
+                                    f"Failed to kill process {pid_int}.\n"
+                                    f"Please kill it manually: kill {pid_int}\n"
+                                    f"Or use: python check_db_lock.py --kill-pid {pid_int}\n"
+                                    f"Original error: {read_error}"
+                                ) from read_error
+                        else:
+                            # User chose to cancel
+                            raise RuntimeError(
+                                f"Cannot access DuckDB database. Process {pid_int} is holding a lock.\n"
+                                f"Run: kill {pid_int}\n"
+                                f"Or use: python check_db_lock.py --kill-pid {pid_int}\n"
+                                f"Original error: {read_error}"
+                            ) from read_error
                     raise
             else:
                 raise
