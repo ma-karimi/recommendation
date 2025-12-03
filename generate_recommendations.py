@@ -624,7 +624,24 @@ def main(sample_size: int = None):
     # ذخیره در فایل (backup)
     output_file = save_recommendations(recommendations_df, cfg.output_dir)
     
-    # ذخیره در Redis
+    # ذخیره در DuckDB (persistent storage)
+    try:
+        if recommender.storage:
+            recommender.storage.save_recommendations_batch(recommendations_df, overwrite=True)
+            duckdb_stats = recommender.storage.get_recommendations_stats()
+            print(f"\n📊 آمار DuckDB:")
+            print(f"   تعداد کل توصیه‌ها: {duckdb_stats['total_recommendations']:,}")
+            print(f"   تعداد کاربران با توصیه: {duckdb_stats['users_with_recommendations']:,}")
+            if duckdb_stats.get('last_generated_at'):
+                print(f"   آخرین تولید: {duckdb_stats['last_generated_at']}")
+        else:
+            print("⚠️  ModelStorage در دسترس نیست - توصیه‌ها در DuckDB ذخیره نشد")
+    except Exception as e:
+        print(f"⚠️  خطا در ذخیره DuckDB: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # ذخیره در Redis (cache)
     try:
         from recommendation_storage import get_storage
         storage = get_storage()
@@ -632,16 +649,16 @@ def main(sample_size: int = None):
         if storage.test_connection():
             stats = storage.store_batch_from_dataframe(recommendations_df, batch_size=1000)
             storage_stats = storage.get_stats()
-            print(f"\n📊 آمار Redis:")
+            print(f"\n📊 آمار Redis (Cache):")
             print(f"   تعداد توصیه‌ها در حافظه: {storage_stats['total_recommendations']}")
             print(f"   استفاده از حافظه: {storage_stats['memory_usage_mb']} MB")
         else:
-            print("⚠️  Redis در دسترس نیست - فقط فایل ذخیره شد")
+            print("⚠️  Redis در دسترس نیست - فقط DuckDB و فایل ذخیره شد")
     except ImportError:
-        print("⚠️  ماژول recommendation_storage پیدا نشد - فقط فایل ذخیره شد")
+        print("⚠️  ماژول recommendation_storage پیدا نشد - فقط DuckDB و فایل ذخیره شد")
     except Exception as e:
         print(f"⚠️  خطا در ذخیره Redis: {e}")
-        print("   ✅ فایل‌ها به درستی ذخیره شدند")
+        print("   ✅ DuckDB و فایل‌ها به درستی ذخیره شدند")
     
     # 10. نمایش نمونه توصیه‌ها
     # اطمینان از وجود products_df (برای جلوگیری از خطا)
@@ -821,7 +838,24 @@ def main_for_specific_users(user_ids: List[int], top_k: int = 20):
     # ذخیره در فایل
     output_file = save_recommendations(recommendations_df, cfg.output_dir)
     
-    # ذخیره در Redis
+    # ذخیره در DuckDB (persistent storage)
+    try:
+        if recommender.storage:
+            recommender.storage.save_recommendations_batch(recommendations_df, overwrite=True)
+            duckdb_stats = recommender.storage.get_recommendations_stats()
+            print(f"\n📊 آمار DuckDB:")
+            print(f"   تعداد کل توصیه‌ها: {duckdb_stats['total_recommendations']:,}")
+            print(f"   تعداد کاربران با توصیه: {duckdb_stats['users_with_recommendations']:,}")
+            if duckdb_stats.get('last_generated_at'):
+                print(f"   آخرین تولید: {duckdb_stats['last_generated_at']}")
+        else:
+            print("⚠️  ModelStorage در دسترس نیست - توصیه‌ها در DuckDB ذخیره نشد")
+    except Exception as e:
+        print(f"⚠️  خطا در ذخیره DuckDB: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # ذخیره در Redis (cache)
     try:
         from recommendation_storage import get_storage
         storage = get_storage()
@@ -829,16 +863,16 @@ def main_for_specific_users(user_ids: List[int], top_k: int = 20):
         if storage.test_connection():
             stats = storage.store_batch_from_dataframe(recommendations_df, batch_size=1000)
             storage_stats = storage.get_stats()
-            print(f"\n📊 آمار Redis:")
+            print(f"\n📊 آمار Redis (Cache):")
             print(f"   تعداد توصیه‌ها در حافظه: {storage_stats['total_recommendations']}")
             print(f"   استفاده از حافظه: {storage_stats['memory_usage_mb']} MB")
         else:
-            print("⚠️  Redis در دسترس نیست - فقط فایل ذخیره شد")
+            print("⚠️  Redis در دسترس نیست - فقط DuckDB و فایل ذخیره شد")
     except ImportError:
-        print("⚠️  ماژول recommendation_storage پیدا نشد - فقط فایل ذخیره شد")
+        print("⚠️  ماژول recommendation_storage پیدا نشد - فقط DuckDB و فایل ذخیره شد")
     except Exception as e:
         print(f"⚠️  خطا در ذخیره Redis: {e}")
-        print("   ✅ فایل‌ها به درستی ذخیره شدند")
+        print("   ✅ DuckDB و فایل‌ها به درستی ذخیره شدند")
     
     # 6. نمایش نمونه توصیه‌ها
     print_sample_recommendations(recommendations_df, products_df, n_users=min(5, len(user_ids)))

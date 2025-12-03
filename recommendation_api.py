@@ -240,11 +240,19 @@ def _convert_recommendation_to_response(
 async def get_user_recommendations(
     user_id: int,
     limit: int = 10,
-    use_redis: bool = True
+    use_redis: bool = True,
+    use_duckdb: bool = True
 ):
-    """دریافت توصیه‌های کاربر از Redis یا تولید مستقیم"""
+    """
+    دریافت توصیه‌های کاربر از Redis (cache) یا DuckDB (persistent) یا تولید مستقیم
+    
+    ترتیب بررسی:
+    1. Redis (cache) - سریع‌ترین
+    2. DuckDB (persistent) - اگر Redis در دسترس نباشد
+    3. تولید مستقیم (fallback) - اگر هیچکدام در دسترس نباشد
+    """
     try:
-        # تلاش برای خواندن از Redis
+        # 1. تلاش برای خواندن از Redis (cache)
         if use_redis:
             storage = app_state.init_redis_storage()
             if storage and storage.exists(user_id):
@@ -261,7 +269,29 @@ async def get_user_recommendations(
                     logger.debug(f"Retrieved {len(response)} recommendations from Redis for user {user_id}")
                     return response
         
-        # Fallback: اگر Redis در دسترس نباشد یا توصیه وجود نداشته باشد
+        # 2. Fallback: خواندن از DuckDB (persistent storage)
+        if use_duckdb:
+            try:
+                from model_storage import ModelStorage
+                duckdb_storage = ModelStorage(read_only=True)
+                
+                if duckdb_storage.user_has_recommendations(user_id):
+                    recs_dict = duckdb_storage.load_user_recommendations(user_id, limit=limit)
+                    
+                    if recs_dict:
+                        response = [
+                            _convert_recommendation_to_response(
+                                rec,
+                                get_product_info(rec['product_id'])
+                            )
+                            for rec in recs_dict
+                        ]
+                        logger.debug(f"Retrieved {len(response)} recommendations from DuckDB for user {user_id}")
+                        return response
+            except Exception as e:
+                logger.warning(f"Error reading from DuckDB for user {user_id}: {e}")
+        
+        # 3. Fallback: تولید مستقیم (اگر هیچکدام در دسترس نباشد)
         logger.info(f"Using fallback mode for user {user_id}")
         recommender_instance = get_recommender()
         if recommender_instance:
@@ -419,11 +449,21 @@ async def get_system_stats():
         except Exception as e:
             logger.warning(f"Error getting Redis stats: {e}")
     
+    # آمار DuckDB
+    duckdb_stats = {}
+    try:
+        from model_storage import ModelStorage
+        duckdb_storage = ModelStorage(read_only=True)
+        duckdb_stats = duckdb_storage.get_recommendations_stats()
+    except Exception as e:
+        logger.warning(f"Error getting DuckDB stats: {e}")
+    
     return {
         "total_products": len(app_state.products_cache),
         "recommender_ready": app_state.recommender is not None,
         "redis_connected": redis_connected,
-        "redis_stats": redis_stats
+        "redis_stats": redis_stats,
+        "duckdb_stats": duckdb_stats
     }
 
 

@@ -450,6 +450,32 @@ class ModelStorage:
             )
         """)
         
+        # Create table for storing user recommendations (persistent storage)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_recommendations (
+                user_id INTEGER,
+                product_id INTEGER,
+                score REAL,
+                rank INTEGER,
+                confidence REAL,
+                reason TEXT,
+                collaborative_details TEXT,
+                generated_at TIMESTAMP,
+                PRIMARY KEY (user_id, product_id, rank)
+            )
+        """)
+        
+        # Create index for faster lookups
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_recommendations_user_id 
+            ON user_recommendations(user_id)
+        """)
+        
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_recommendations_generated_at 
+            ON user_recommendations(generated_at)
+        """)
+        
         logger.info(f"Model storage initialized at {self.db_path} (read_only={self.read_only})")
     
     def save_collaborative_model(
@@ -885,6 +911,152 @@ class ModelStorage:
             return load_npz(path)
         return None
     
+    def save_recommendations_batch(self, recommendations_df: pl.DataFrame, overwrite: bool = True) -> None:
+        """
+        ذخیره توصیه‌ها در DuckDB (persistent storage)
+        
+        Args:
+            recommendations_df: DataFrame شامل توصیه‌ها با ستون‌های:
+                - user_id
+                - product_id
+                - score
+                - rank
+                - confidence
+                - reason
+                - collaborative_details (اختیاری)
+                - generated_at (اختیاری)
+            overwrite: اگر True باشد، توصیه‌های قبلی کاربر را حذف می‌کند
+        """
+        if self.read_only:
+            raise RuntimeError("Cannot save recommendations: storage is in read-only mode")
+        
+        if recommendations_df.is_empty():
+            logger.warning("Empty recommendations DataFrame, nothing to save")
+            return
+        
+        logger.info(f"Saving {len(recommendations_df)} recommendations to DuckDB...")
+        
+        conn = self._get_connection(read_only=False)
+        
+        # حذف توصیه‌های قبلی برای کاربران موجود (اگر overwrite=True)
+        if overwrite:
+            user_ids = recommendations_df['user_id'].unique().to_list()
+            if user_ids:
+                placeholders = ','.join(['?'] * len(user_ids))
+                conn.execute(f"DELETE FROM user_recommendations WHERE user_id IN ({placeholders})", user_ids)
+                logger.debug(f"Deleted existing recommendations for {len(user_ids)} users")
+        
+        # تبدیل DataFrame به لیست tuples برای insert
+        import datetime as dt
+        
+        data_to_insert = []
+        for row in recommendations_df.iter_rows(named=True):
+            # تبدیل collaborative_details به string اگر dict است
+            collaborative_details = row.get('collaborative_details')
+            if collaborative_details and not isinstance(collaborative_details, str):
+                import json
+                collaborative_details = json.dumps(collaborative_details, ensure_ascii=False)
+            
+            # تبدیل generated_at به datetime اگر string است
+            generated_at = row.get('generated_at')
+            if generated_at and isinstance(generated_at, str):
+                generated_at = dt.datetime.fromisoformat(generated_at.replace('Z', '+00:00'))
+            elif not generated_at:
+                generated_at = dt.datetime.now()
+            
+            data_to_insert.append((
+                int(row['user_id']),
+                int(row['product_id']),
+                float(row['score']),
+                int(row['rank']),
+                float(row.get('confidence', 0.0)),
+                str(row.get('reason', '')),
+                str(collaborative_details) if collaborative_details else None,
+                generated_at
+            ))
+        
+        # Insert به صورت batch
+        conn.executemany("""
+            INSERT OR REPLACE INTO user_recommendations 
+            (user_id, product_id, score, rank, confidence, reason, collaborative_details, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, data_to_insert)
+        
+        conn.commit()
+        logger.info(f"Successfully saved {len(data_to_insert)} recommendations to DuckDB")
+    
+    def load_user_recommendations(self, user_id: int, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        بارگذاری توصیه‌های یک کاربر از DuckDB
+        
+        Args:
+            user_id: شناسه کاربر
+            limit: محدود کردن تعداد توصیه (None = همه)
+        
+        Returns:
+            لیست توصیه‌ها به صورت dict
+        """
+        conn = self._get_connection(read_only=True)
+        
+        query = """
+            SELECT product_id, score, rank, confidence, reason, collaborative_details, generated_at
+            FROM user_recommendations
+            WHERE user_id = ?
+            ORDER BY rank ASC
+        """
+        
+        params = [user_id]
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        
+        result = conn.execute(query, params).fetchall()
+        
+        recommendations = []
+        for row in result:
+            rec = {
+                'product_id': row[0],
+                'score': float(row[1]),
+                'rank': int(row[2]),
+                'confidence': float(row[3]),
+                'reason': str(row[4]) if row[4] else '',
+                'collaborative_details': row[5],
+                'generated_at': row[6].isoformat() if row[6] else None
+            }
+            recommendations.append(rec)
+        
+        return recommendations
+    
+    def user_has_recommendations(self, user_id: int) -> bool:
+        """بررسی وجود توصیه برای کاربر در DuckDB"""
+        conn = self._get_connection(read_only=True)
+        result = conn.execute(
+            "SELECT COUNT(*) FROM user_recommendations WHERE user_id = ?",
+            [user_id]
+        ).fetchone()
+        
+        return result[0] > 0 if result else False
+    
+    def get_recommendations_stats(self) -> Dict[str, Any]:
+        """دریافت آمار توصیه‌های ذخیره شده در DuckDB"""
+        conn = self._get_connection(read_only=True)
+        
+        stats = {}
+        
+        # تعداد کل توصیه‌ها
+        result = conn.execute("SELECT COUNT(*) FROM user_recommendations").fetchone()
+        stats['total_recommendations'] = result[0] if result else 0
+        
+        # تعداد کاربران با توصیه
+        result = conn.execute("SELECT COUNT(DISTINCT user_id) FROM user_recommendations").fetchone()
+        stats['users_with_recommendations'] = result[0] if result else 0
+        
+        # آخرین تاریخ تولید
+        result = conn.execute("SELECT MAX(generated_at) FROM user_recommendations").fetchone()
+        stats['last_generated_at'] = result[0].isoformat() if result and result[0] else None
+        
+        return stats
+    
     def clear_all(self) -> None:
         """Clear all model data from database"""
         logger.warning("Clearing all model data from database...")
@@ -896,6 +1068,7 @@ class ModelStorage:
         self.conn.execute("DELETE FROM product_features")
         self.conn.execute("DELETE FROM product_vectors")
         self.conn.execute("DELETE FROM model_metadata")
+        self.conn.execute("DELETE FROM user_recommendations")
         self.conn.commit()
         logger.info("All model data cleared")
     
