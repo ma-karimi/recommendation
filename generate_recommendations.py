@@ -17,7 +17,7 @@ import os
 import gc
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import numpy as np
 import polars as pl
@@ -855,6 +855,109 @@ def main_for_specific_users(user_ids: List[int], top_k: int = 20):
     print(f"{'='*80}\n")
 
 
+def find_users_without_recommendations(limit: Optional[int] = None, output_file: Optional[str] = None) -> List[int]:
+    """
+    پیدا کردن کاربرانی که توصیه برایشان ایجاد نشده است
+    
+    Args:
+        limit: محدود کردن تعداد کاربران برای بررسی (None = همه)
+        output_file: مسیر فایل برای ذخیره لیست (اختیاری)
+        
+    Returns:
+        لیست user_id های کاربران بدون توصیه
+    """
+    print("="*80)
+    print("جستجوی کاربران بدون توصیه")
+    print("="*80)
+    print()
+    
+    # 1. بارگذاری کاربران
+    print("📥 بارگذاری کاربران از دیتابیس...")
+    users_df = load_users_from_db()
+    if users_df.is_empty():
+        print("❌ هیچ کاربری یافت نشد!")
+        return []
+    
+    print(f"✅ {len(users_df)} کاربر بارگذاری شد")
+    
+    # محدود کردن اگر limit مشخص شده
+    if limit and limit < len(users_df):
+        users_df = users_df.head(limit)
+        print(f"⚠️  محدود شد به {limit} کاربر برای بررسی")
+    
+    # 2. بررسی وجود توصیه در Redis
+    print("\n🔍 بررسی وجود توصیه‌ها در Redis...")
+    try:
+        from recommendation_storage import get_storage
+        storage = get_storage()
+        
+        if not storage.test_connection():
+            print("❌ Redis در دسترس نیست!")
+            return []
+        
+        print("✅ اتصال به Redis برقرار شد")
+        
+    except ImportError:
+        print("❌ ماژول recommendation_storage پیدا نشد!")
+        return []
+    except Exception as e:
+        print(f"❌ خطا در اتصال به Redis: {e}")
+        return []
+    
+    # 3. بررسی هر کاربر
+    user_ids = users_df['id'].to_list()
+    users_with_recommendations = []
+    users_without_recommendations = []
+    
+    total_users = len(user_ids)
+    print(f"\n📊 بررسی {total_users} کاربر...")
+    
+    # بررسی به صورت batch
+    batch_size = 100
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i:i + batch_size]
+        
+        for user_id in batch:
+            if storage.exists(user_id):
+                users_with_recommendations.append(user_id)
+            else:
+                users_without_recommendations.append(user_id)
+        
+        # نمایش پیشرفت
+        checked = min(i + batch_size, total_users)
+        if checked % 1000 == 0 or checked == total_users:
+            print(f"   بررسی شده: {checked}/{total_users} ({checked/total_users*100:.1f}%)")
+    
+    # 4. نمایش نتایج
+    print(f"\n{'='*80}")
+    print("📊 نتایج:")
+    print(f"{'='*80}")
+    print(f"   کل کاربران بررسی شده: {total_users:,}")
+    print(f"   کاربران با توصیه: {len(users_with_recommendations):,} ({len(users_with_recommendations)/total_users*100:.1f}%)")
+    print(f"   کاربران بدون توصیه: {len(users_without_recommendations):,} ({len(users_without_recommendations)/total_users*100:.1f}%)")
+    print(f"{'='*80}\n")
+    
+    # 5. ذخیره در فایل اگر مشخص شده
+    if output_file and users_without_recommendations:
+        import os
+        os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+        
+        # ذخیره به صورت CSV
+        import polars as pl
+        df = pl.DataFrame({'user_id': users_without_recommendations})
+        df.write_csv(output_file)
+        print(f"💾 لیست کاربران بدون توصیه در فایل ذخیره شد: {output_file}")
+        
+        # همچنین یک فایل txt ساده
+        txt_file = output_file.replace('.csv', '.txt')
+        with open(txt_file, 'w') as f:
+            for user_id in users_without_recommendations:
+                f.write(f"{user_id}\n")
+        print(f"💾 نسخه TXT نیز ذخیره شد: {txt_file}")
+    
+    return users_without_recommendations
+
+
 if __name__ == "__main__":
     import sys
     import argparse
@@ -930,7 +1033,46 @@ if __name__ == "__main__":
         help='تعداد توصیه برای هر کاربر (پیش‌فرض: 20)'
     )
     
+    parser.add_argument(
+        '--find-without-recommendations',
+        action='store_true',
+        help='پیدا کردن کاربران بدون توصیه'
+    )
+    
+    parser.add_argument(
+        '--output-file',
+        type=str,
+        default=None,
+        metavar='FILE',
+        help='مسیر فایل برای ذخیره لیست کاربران بدون توصیه (مثال: users_without_recs.csv)'
+    )
+    
     args = parser.parse_args()
+    
+    # اگر find-without-recommendations استفاده شده
+    if args.find_without_recommendations:
+        try:
+            users_without = find_users_without_recommendations(
+                limit=args.sample,
+                output_file=args.output_file
+            )
+            if users_without:
+                print(f"\n✅ {len(users_without)} کاربر بدون توصیه پیدا شد")
+                print(f"\nبرای تولید توصیه برای این کاربران:")
+                print(f"python generate_recommendations.py --users {' '.join(map(str, users_without[:10]))}")
+                if len(users_without) > 10:
+                    print(f"   (فقط 10 کاربر اول نمایش داده شد)")
+            else:
+                print("\n✅ همه کاربران توصیه دارند!")
+            sys.exit(0)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n\n❌ خطای غیرمنتظره: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
     # پردازش arguments
     if args.user:

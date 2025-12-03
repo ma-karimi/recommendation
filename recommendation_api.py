@@ -602,6 +602,166 @@ async def delete_job(job_id: str):
     return {"message": f"Job {job_id} حذف شد"}
 
 
+class UsersWithoutRecommendationsResponse(BaseModel):
+    """پاسخ لیست کاربران بدون توصیه"""
+    total_users: int
+    users_with_recommendations: int
+    users_without_recommendations: int
+    user_ids_without_recommendations: List[int]
+    percentage_with_recommendations: float
+    percentage_without_recommendations: float
+
+
+@app.get("/users-without-recommendations", response_model=UsersWithoutRecommendationsResponse)
+async def get_users_without_recommendations(
+    limit: Optional[int] = None,
+    check_all: bool = False
+):
+    """
+    دریافت لیست کاربرانی که توصیه برایشان ایجاد نشده است
+    
+    Args:
+        limit: محدود کردن تعداد کاربران برای بررسی (None = همه)
+        check_all: اگر True باشد، همه کاربران را بررسی می‌کند (ممکن است کند باشد)
+    
+    Returns:
+        لیست user_id های کاربران بدون توصیه
+    """
+    try:
+        # بارگذاری کاربران از دیتابیس
+        from generate_recommendations import load_users_from_db
+        import polars as pl
+        
+        logger.info("Loading users from database...")
+        users_df = load_users_from_db()
+        
+        if users_df.is_empty():
+            raise HTTPException(status_code=404, detail="هیچ کاربری یافت نشد")
+        
+        # محدود کردن اگر limit مشخص شده
+        if limit and limit < len(users_df):
+            users_df = users_df.head(limit)
+            logger.info(f"Limited to {limit} users for checking")
+        
+        # دریافت storage
+        storage = app_state.init_redis_storage()
+        if not storage or not storage.test_connection():
+            raise HTTPException(
+                status_code=503,
+                detail="Redis در دسترس نیست. برای بررسی نیاز به Redis است."
+            )
+        
+        # بررسی وجود توصیه برای هر کاربر
+        logger.info(f"Checking recommendations for {len(users_df)} users...")
+        user_ids = users_df['id'].to_list()
+        
+        users_with_recommendations = []
+        users_without_recommendations = []
+        
+        # بررسی به صورت batch برای سرعت بیشتر
+        batch_size = 100
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i:i + batch_size]
+            
+            for user_id in batch:
+                if storage.exists(user_id):
+                    users_with_recommendations.append(user_id)
+                else:
+                    users_without_recommendations.append(user_id)
+            
+            # Log progress
+            if (i + batch_size) % 1000 == 0 or (i + batch_size) >= len(user_ids):
+                logger.info(f"Checked {min(i + batch_size, len(user_ids))}/{len(user_ids)} users...")
+        
+        total_users = len(user_ids)
+        users_with_count = len(users_with_recommendations)
+        users_without_count = len(users_without_recommendations)
+        
+        percentage_with = (users_with_count / total_users * 100) if total_users > 0 else 0
+        percentage_without = (users_without_count / total_users * 100) if total_users > 0 else 0
+        
+        logger.info(
+            f"Summary: {users_with_count} with recommendations, "
+            f"{users_without_count} without ({percentage_without:.1f}%)"
+        )
+        
+        return UsersWithoutRecommendationsResponse(
+            total_users=total_users,
+            users_with_recommendations=users_with_count,
+            users_without_recommendations=users_without_count,
+            user_ids_without_recommendations=users_without_recommendations,
+            percentage_with_recommendations=round(percentage_with, 2),
+            percentage_without_recommendations=round(percentage_without, 2)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting users without recommendations: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در دریافت لیست کاربران: {str(e)}"
+        )
+
+
+@app.get("/users-without-recommendations/count")
+async def get_users_without_recommendations_count():
+    """
+    دریافت تعداد کاربران بدون توصیه (سریع‌تر از endpoint کامل)
+    
+    این endpoint فقط تعداد را برمی‌گرداند و لیست user_id ها را نمی‌دهد.
+    """
+    try:
+        from generate_recommendations import load_users_from_db
+        
+        users_df = load_users_from_db()
+        if users_df.is_empty():
+            return {
+                "total_users": 0,
+                "users_without_recommendations": 0
+            }
+        
+        storage = app_state.init_redis_storage()
+        if not storage or not storage.test_connection():
+            raise HTTPException(
+                status_code=503,
+                detail="Redis در دسترس نیست"
+            )
+        
+        user_ids = users_df['id'].to_list()
+        users_without_count = 0
+        
+        # بررسی سریع (نمونه‌گیری)
+        sample_size = min(1000, len(user_ids))
+        sample_ids = user_ids[:sample_size]
+        
+        for user_id in sample_ids:
+            if not storage.exists(user_id):
+                users_without_count += 1
+        
+        # تخمین برای کل
+        estimated_percentage = (users_without_count / sample_size * 100) if sample_size > 0 else 0
+        estimated_total_without = int(len(user_ids) * estimated_percentage / 100)
+        
+        return {
+            "total_users": len(user_ids),
+            "sample_size": sample_size,
+            "users_without_in_sample": users_without_count,
+            "estimated_percentage_without": round(estimated_percentage, 2),
+            "estimated_users_without_recommendations": estimated_total_without,
+            "note": "این یک تخمین است. برای لیست دقیق از /users-without-recommendations استفاده کنید"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error counting users without recommendations: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در شمارش کاربران: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
