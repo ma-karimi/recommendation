@@ -6,10 +6,14 @@ API برای سیستم توصیه محصولات
 from __future__ import annotations
 import json
 import logging
+import uuid
+import threading
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
+from datetime import datetime
+from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel
 
 from hybrid_recommender import HybridRecommender
@@ -52,6 +56,34 @@ class SimilarProductsResponse(BaseModel):
     product_price: Optional[float] = None
 
 
+class JobStatus(str, Enum):
+    """وضعیت job"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class GenerateRecommendationsRequest(BaseModel):
+    """درخواست تولید توصیه"""
+    user_ids: List[int]
+    top_k: int = 20
+
+
+class JobResponse(BaseModel):
+    """پاسخ job"""
+    job_id: str
+    status: JobStatus
+    message: str
+    created_at: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    total_users: int = 0
+    processed_users: int = 0
+    failed_users: int = 0
+    error: Optional[str] = None
+
+
 # State management برای مدل و cache
 class AppState:
     """مدیریت state اپلیکیشن"""
@@ -59,6 +91,9 @@ class AppState:
         self.recommender: Optional[HybridRecommender] = None
         self.products_cache: Dict[int, Product] = {}
         self.storage = None
+        # Job tracking
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.jobs_lock = threading.Lock()
     
     def init_redis_storage(self):
         """دریافت یا initialize کردن Redis storage"""
@@ -390,6 +425,181 @@ async def get_system_stats():
         "redis_connected": redis_connected,
         "redis_stats": redis_stats
     }
+
+
+def _update_job_status(job_id: str, **kwargs):
+    """به‌روزرسانی وضعیت job"""
+    with app_state.jobs_lock:
+        if job_id in app_state.jobs:
+            app_state.jobs[job_id].update(kwargs)
+            app_state.jobs[job_id]['updated_at'] = datetime.now().isoformat()
+
+
+def _generate_recommendations_background(job_id: str, user_ids: List[int], top_k: int):
+    """تولید توصیه در پس‌زمینه"""
+    try:
+        _update_job_status(job_id, status=JobStatus.RUNNING, started_at=datetime.now().isoformat())
+        logger.info(f"Job {job_id}: Starting recommendation generation for {len(user_ids)} users")
+        
+        # Import here to avoid circular imports
+        import sys
+        import os
+        # اضافه کردن مسیر فعلی به sys.path برای import
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+        
+        from generate_recommendations import generate_recommendations_for_users, main_for_specific_users
+        
+        # اجرای تولید توصیه
+        # استفاده از main_for_specific_users که همه چیز را مدیریت می‌کند
+        main_for_specific_users(user_ids, top_k=top_k)
+        
+        _update_job_status(
+            job_id,
+            status=JobStatus.COMPLETED,
+            completed_at=datetime.now().isoformat(),
+            processed_users=len(user_ids),
+            message=f"توصیه‌ها با موفقیت برای {len(user_ids)} کاربر تولید شد"
+        )
+        logger.info(f"Job {job_id}: Completed successfully")
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Job {job_id}: Failed with error: {error_msg}", exc_info=True)
+        _update_job_status(
+            job_id,
+            status=JobStatus.FAILED,
+            completed_at=datetime.now().isoformat(),
+            error=error_msg,
+            message=f"خطا در تولید توصیه: {error_msg}"
+        )
+
+
+@app.post("/generate-recommendations", response_model=JobResponse)
+async def generate_recommendations(
+    request: GenerateRecommendationsRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    تولید توصیه برای کاربران مشخص در پس‌زمینه
+    
+    این endpoint فوراً برمی‌گردد و فرآیند تولید توصیه در پس‌زمینه اجرا می‌شود.
+    برای بررسی وضعیت از endpoint /job-status/{job_id} استفاده کنید.
+    """
+    if not request.user_ids:
+        raise HTTPException(status_code=400, detail="لیست user_id ها نمی‌تواند خالی باشد")
+    
+    if request.top_k <= 0 or request.top_k > 100:
+        raise HTTPException(status_code=400, detail="top_k باید بین 1 تا 100 باشد")
+    
+    # ایجاد job ID
+    job_id = str(uuid.uuid4())
+    
+    # ثبت job
+    with app_state.jobs_lock:
+        app_state.jobs[job_id] = {
+            'job_id': job_id,
+            'status': JobStatus.PENDING,
+            'message': 'در انتظار شروع...',
+            'created_at': datetime.now().isoformat(),
+            'total_users': len(request.user_ids),
+            'processed_users': 0,
+            'failed_users': 0,
+            'user_ids': request.user_ids,
+            'top_k': request.top_k
+        }
+    
+    # اضافه کردن task به پس‌زمینه
+    background_tasks.add_task(
+        _generate_recommendations_background,
+        job_id,
+        request.user_ids,
+        request.top_k
+    )
+    
+    logger.info(f"Job {job_id} created for {len(request.user_ids)} users")
+    
+    return JobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="درخواست ثبت شد و در حال پردازش است",
+        created_at=app_state.jobs[job_id]['created_at'],
+        total_users=len(request.user_ids)
+    )
+
+
+@app.get("/job-status/{job_id}", response_model=JobResponse)
+async def get_job_status(job_id: str):
+    """بررسی وضعیت job"""
+    with app_state.jobs_lock:
+        job = app_state.jobs.get(job_id)
+    
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} یافت نشد")
+    
+    return JobResponse(
+        job_id=job['job_id'],
+        status=JobStatus(job['status']),
+        message=job.get('message', ''),
+        created_at=job['created_at'],
+        started_at=job.get('started_at'),
+        completed_at=job.get('completed_at'),
+        total_users=job.get('total_users', 0),
+        processed_users=job.get('processed_users', 0),
+        failed_users=job.get('failed_users', 0),
+        error=job.get('error')
+    )
+
+
+@app.get("/jobs", response_model=List[JobResponse])
+async def list_jobs(limit: int = 10):
+    """لیست آخرین job ها"""
+    with app_state.jobs_lock:
+        # مرتب‌سازی بر اساس created_at (جدیدترین اول)
+        sorted_jobs = sorted(
+            app_state.jobs.values(),
+            key=lambda x: x.get('created_at', ''),
+            reverse=True
+        )[:limit]
+    
+    return [
+        JobResponse(
+            job_id=job['job_id'],
+            status=JobStatus(job['status']),
+            message=job.get('message', ''),
+            created_at=job['created_at'],
+            started_at=job.get('started_at'),
+            completed_at=job.get('completed_at'),
+            total_users=job.get('total_users', 0),
+            processed_users=job.get('processed_users', 0),
+            failed_users=job.get('failed_users', 0),
+            error=job.get('error')
+        )
+        for job in sorted_jobs
+    ]
+
+
+@app.delete("/job/{job_id}")
+async def delete_job(job_id: str):
+    """حذف job (فقط job های completed یا failed)"""
+    with app_state.jobs_lock:
+        job = app_state.jobs.get(job_id)
+        
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} یافت نشد")
+        
+        status = JobStatus(job['status'])
+        if status in [JobStatus.RUNNING, JobStatus.PENDING]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"نمی‌توان job در حال اجرا (status: {status}) را حذف کرد"
+            )
+        
+        del app_state.jobs[job_id]
+        logger.info(f"Job {job_id} deleted")
+    
+    return {"message": f"Job {job_id} حذف شد"}
 
 
 if __name__ == "__main__":
