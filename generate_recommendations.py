@@ -173,6 +173,83 @@ def load_matomo_product_popularity() -> Dict[int, float]:
     return product_popularity
 
 
+def generate_recommendations_for_users(
+    recommender: HybridRecommender,
+    user_ids: List[int],
+    top_k: int = 20
+) -> pl.DataFrame:
+    """
+    تولید توصیه برای لیست مشخصی از کاربران
+    
+    Args:
+        recommender: مدل توصیه‌گر (باید قبلاً train شده باشد)
+        user_ids: لیست ID های کاربران
+        top_k: تعداد توصیه برای هر کاربر
+        
+    Returns:
+        DataFrame شامل توصیه‌ها
+    """
+    if not user_ids:
+        logger.warning("No user IDs provided")
+        return pl.DataFrame()
+    
+    recommendations_data = []
+    
+    logger.info(f"Starting recommendation generation for {len(user_ids)} specific users...")
+    
+    # شمارنده برای نمایش پیشرفت
+    total_users = len(user_ids)
+    users_with_recommendations = 0
+    users_without_recommendations = 0
+    
+    for idx, user_id in enumerate(user_ids, 1):
+        # نمایش پیشرفت
+        if idx % 10 == 0 or idx == total_users:
+            logger.info(f"Processing user {idx}/{total_users} (User ID: {user_id})...")
+        
+        try:
+            # دریافت توصیه‌ها
+            recommendations = recommender.get_recommendations(user_id, top_k)
+            
+            if recommendations:
+                users_with_recommendations += 1
+                
+                # اضافه کردن توصیه‌ها به لیست
+                for rank, rec in enumerate(recommendations, 1):
+                    recommendations_data.append({
+                        'user_id': user_id,
+                        'product_id': rec.product_id,
+                        'score': rec.score,
+                        'rank': rank,
+                        'confidence': rec.confidence,
+                        'reason': rec.reason,
+                        'collaborative_details': rec.collaborative_details,
+                        'generated_at': dt.datetime.now()
+                    })
+            else:
+                users_without_recommendations += 1
+                logger.debug(f"No recommendations for user {user_id}")
+                
+        except Exception as e:
+            users_without_recommendations += 1
+            logger.warning(f"Error for user {user_id}: {e}")
+    
+    logger.info(
+        f"Summary: {users_with_recommendations} users with recommendations, "
+        f"{users_without_recommendations} without. "
+        f"Total recommendations: {len(recommendations_data)}"
+    )
+    
+    if not recommendations_data:
+        logger.error("No recommendations generated!")
+        return pl.DataFrame()
+    
+    # تبدیل به DataFrame
+    recommendations_df = pl.DataFrame(recommendations_data)
+    
+    return recommendations_df
+
+
 def generate_recommendations_for_all_users(
     recommender: HybridRecommender,
     users_df: pl.DataFrame,
@@ -602,6 +679,182 @@ def main(sample_size: int = None):
     print(f"{'='*80}\n")
 
 
+def main_for_specific_users(user_ids: List[int], top_k: int = 20):
+    """
+    تولید توصیه برای کاربران مشخص (بدون train کردن مجدد مدل)
+    
+    Args:
+        user_ids: لیست ID های کاربران
+        top_k: تعداد توصیه برای هر کاربر
+    """
+    print("="*80)
+    print("سیستم تولید توصیه محصولات")
+    print(f"🎯 حالت کاربران مشخص - {len(user_ids)} کاربر")
+    print("="*80)
+    print()
+    
+    cfg = load_config()
+    
+    # 1. بارگذاری محصولات (برای فیلترهای تجاری)
+    print("📥 بارگذاری محصولات از دیتابیس...")
+    products_df = load_products_from_db()
+    if products_df.is_empty():
+        print("❌ هیچ محصولی یافت نشد!")
+        return
+    print(f"✅ {len(products_df)} محصول بارگذاری شد")
+    
+    # 2. تبدیل محصولات به لیست
+    products_list = []
+    for row in products_df.iter_rows(named=True):
+        from models import Product
+        product = Product(
+            id=row['id'],
+            title=row['title'],
+            slug=row['slug'],
+            sku=row['sku'],
+            sale_price=float(row['sale_price'] or 0),
+            stock_quantity=int(row['stock_quantity'] or 0),
+            status='published' if row['status'] == 1 else 'draft',
+            published_at=row.get('published_at'),
+            seller_id=row.get('seller_id'),
+            category_id=row.get('category_id')
+        )
+        products_list.append(product)
+    
+    # 3. Initialize recommender (از storage استفاده می‌کند)
+    print("\n🔄 بارگذاری مدل از storage...")
+    print("   (مدل باید قبلاً train شده باشد)")
+    
+    recommender = HybridRecommender(use_storage=True)
+    
+    # بارگذاری داده‌های پایه (بدون train کردن)
+    recommender.users = load_users()
+    recommender.products = products_list
+    
+    # بارگذاری تعاملات کاربران (فقط برای کاربران مشخص)
+    print(f"📥 بارگذاری تعاملات برای {len(user_ids)} کاربر...")
+    # فقط تعاملات کاربران مشخص را بارگذاری می‌کنیم
+    recommender.user_interactions = {}
+    from object_loader import load_user_purchase_history
+    for user_id in user_ids:
+        purchase_history = load_user_purchase_history(user_id, days_back=365)
+        recommender.user_interactions[user_id] = purchase_history
+    
+    # بارگذاری مدل‌های train شده از storage
+    try:
+        from collaborative_filtering import CollaborativeFiltering
+        from content_based_filtering import ContentBasedFiltering
+        
+        # بارگذاری collaborative model از storage
+        print("   🔹 بارگذاری مدل Collaborative Filtering از storage...")
+        recommender.collaborative_model = CollaborativeFiltering(use_storage=True, storage=recommender.storage)
+        
+        # بارگذاری mappings از storage
+        if recommender.storage:
+            conn = recommender.storage._get_connection(read_only=True)
+            
+            # بارگذاری user mappings
+            user_mappings = conn.execute("SELECT user_id, user_index FROM user_index_mapping").fetchall()
+            recommender.collaborative_model.user_to_index = {row[0]: row[1] for row in user_mappings}
+            recommender.collaborative_model.index_to_user = {row[1]: row[0] for row in user_mappings}
+            
+            # بارگذاری product mappings
+            product_mappings = conn.execute("SELECT product_id, product_index FROM product_index_mapping").fetchall()
+            recommender.collaborative_model.product_to_index = {row[0]: row[1] for row in product_mappings}
+            recommender.collaborative_model.index_to_product = {row[1]: row[0] for row in product_mappings}
+            
+            logger.info(f"Loaded {len(recommender.collaborative_model.user_to_index)} user mappings and {len(recommender.collaborative_model.product_to_index)} product mappings")
+        
+        # بارگذاری content-based model از storage
+        print("   🔹 بارگذاری مدل Content-Based Filtering از storage...")
+        recommender.content_model = ContentBasedFiltering(use_storage=True, storage=recommender.storage)
+        
+        # بارگذاری ANN index
+        if not recommender.content_model._load_ann_index():
+            print("⚠️  ANN index یافت نشد. ممکن است مدل هنوز train نشده باشد.")
+            print("   لطفاً ابتدا مدل را train کنید:")
+            print("   python generate_recommendations.py --sample 100")
+            return
+        
+        # بارگذاری user profiles از storage (اگر وجود داشته باشد)
+        if recommender.storage:
+            try:
+                conn = recommender.storage._get_connection(read_only=True)
+                result = conn.execute("SELECT user_id, profile_data FROM user_profiles").fetchall()
+                user_profiles = {}
+                for row in result:
+                    import pickle
+                    user_profiles[row[0]] = pickle.loads(row[1])
+                
+                if user_profiles:
+                    recommender.content_model.user_profiles = user_profiles
+                    logger.info(f"Loaded {len(user_profiles)} user profiles from storage")
+            except Exception as e:
+                logger.warning(f"Could not load user profiles: {e}")
+        
+        print("✅ مدل‌ها از storage بارگذاری شدند!")
+        
+    except Exception as e:
+        print(f"⚠️  خطا در بارگذاری مدل از storage: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n   ممکن است مدل هنوز train نشده باشد. لطفاً ابتدا مدل را train کنید:")
+        print("   python generate_recommendations.py --sample 100")
+        return
+    
+    # 4. تولید توصیه برای کاربران مشخص
+    print(f"\n🎯 تولید توصیه برای {len(user_ids)} کاربر...")
+    
+    recommendations_df = generate_recommendations_for_users(
+        recommender,
+        user_ids,
+        top_k=top_k
+    )
+    
+    if recommendations_df.is_empty():
+        print("❌ هیچ توصیه‌ای تولید نشد!")
+        return
+    
+    # 5. ذخیره توصیه‌ها
+    print("\n💾 ذخیره توصیه‌ها...")
+    
+    # ذخیره در فایل
+    output_file = save_recommendations(recommendations_df, cfg.output_dir)
+    
+    # ذخیره در Redis
+    try:
+        from recommendation_storage import get_storage
+        storage = get_storage()
+        
+        if storage.test_connection():
+            stats = storage.store_batch_from_dataframe(recommendations_df, batch_size=1000)
+            storage_stats = storage.get_stats()
+            print(f"\n📊 آمار Redis:")
+            print(f"   تعداد توصیه‌ها در حافظه: {storage_stats['total_recommendations']}")
+            print(f"   استفاده از حافظه: {storage_stats['memory_usage_mb']} MB")
+        else:
+            print("⚠️  Redis در دسترس نیست - فقط فایل ذخیره شد")
+    except ImportError:
+        print("⚠️  ماژول recommendation_storage پیدا نشد - فقط فایل ذخیره شد")
+    except Exception as e:
+        print(f"⚠️  خطا در ذخیره Redis: {e}")
+        print("   ✅ فایل‌ها به درستی ذخیره شدند")
+    
+    # 6. نمایش نمونه توصیه‌ها
+    print_sample_recommendations(recommendations_df, products_df, n_users=min(5, len(user_ids)))
+    
+    # 7. آمار نهایی
+    print(f"\n{'='*80}")
+    print("✅ فرآیند تولید توصیه با موفقیت کامل شد!")
+    print(f"{'='*80}")
+    print(f"📊 آمار نهایی:")
+    print(f"   تعداد کاربران: {len(user_ids)}")
+    print(f"   تعداد محصولات: {len(products_df)}")
+    print(f"   تعداد کل توصیه‌ها: {len(recommendations_df)}")
+    print(f"   فایل خروجی: {output_file}")
+    print(f"{'='*80}\n")
+
+
 if __name__ == "__main__":
     import sys
     import argparse
@@ -621,6 +874,15 @@ if __name__ == "__main__":
   # تولید برای همه کاربران
   python generate_recommendations.py
   python generate_recommendations.py --all
+  
+  # تولید برای کاربران مشخص (از command line)
+  python generate_recommendations.py --users 123 456 789
+  
+  # تولید برای کاربران مشخص (از فایل)
+  python generate_recommendations.py --users-file user_ids.txt
+  
+  # تولید برای یک کاربر جدید
+  python generate_recommendations.py --user 12345
         """
     )
     
@@ -638,19 +900,104 @@ if __name__ == "__main__":
         help='پردازش همه کاربران (پیش‌فرض)'
     )
     
+    parser.add_argument(
+        '--users',
+        type=int,
+        nargs='+',
+        metavar='USER_ID',
+        help='لیست ID های کاربران برای تولید توصیه (مثال: --users 123 456 789)'
+    )
+    
+    parser.add_argument(
+        '--user',
+        type=int,
+        metavar='USER_ID',
+        help='تولید توصیه برای یک کاربر (مثال: --user 12345)'
+    )
+    
+    parser.add_argument(
+        '--users-file',
+        type=str,
+        metavar='FILE',
+        help='فایل حاوی لیست user_id ها (هر خط یک user_id)'
+    )
+    
+    parser.add_argument(
+        '--top-k',
+        type=int,
+        default=20,
+        metavar='K',
+        help='تعداد توصیه برای هر کاربر (پیش‌فرض: 20)'
+    )
+    
     args = parser.parse_args()
     
-    # اگر --all استفاده شده، sample_size رو None می‌کنیم
-    sample_size = None if args.all else args.sample
-    
-    try:
-        main(sample_size=sample_size)
-    except KeyboardInterrupt:
-        print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n\n❌ خطای غیرمنتظره: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    # پردازش arguments
+    if args.user:
+        # یک کاربر
+        user_ids = [args.user]
+        try:
+            main_for_specific_users(user_ids, top_k=args.top_k)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n\n❌ خطای غیرمنتظره: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    elif args.users:
+        # لیست کاربران از command line
+        user_ids = args.users
+        try:
+            main_for_specific_users(user_ids, top_k=args.top_k)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n\n❌ خطای غیرمنتظره: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    elif args.users_file:
+        # لیست کاربران از فایل
+        try:
+            with open(args.users_file, 'r') as f:
+                user_ids = [int(line.strip()) for line in f if line.strip() and not line.strip().startswith('#')]
+            
+            if not user_ids:
+                print(f"❌ هیچ user_id معتبری در فایل {args.users_file} یافت نشد!")
+                sys.exit(1)
+            
+            print(f"📄 بارگذاری {len(user_ids)} user_id از فایل {args.users_file}")
+            try:
+                main_for_specific_users(user_ids, top_k=args.top_k)
+            except KeyboardInterrupt:
+                print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
+                sys.exit(1)
+            except Exception as e:
+                print(f"\n\n❌ خطای غیرمنتظره: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+        except FileNotFoundError:
+            print(f"❌ فایل {args.users_file} یافت نشد!")
+            sys.exit(1)
+        except ValueError as e:
+            print(f"❌ خطا در خواندن user_id از فایل: {e}")
+            sys.exit(1)
+    else:
+        # حالت عادی (همه کاربران یا sample)
+        sample_size = None if args.all else args.sample
+        
+        try:
+            main(sample_size=sample_size)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  فرآیند توسط کاربر متوقف شد")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n\n❌ خطای غیرمنتظره: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
