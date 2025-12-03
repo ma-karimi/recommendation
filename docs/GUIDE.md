@@ -19,7 +19,6 @@
 - [نیازمندی‌های منابع](#نیازمندی‌های-منابع)
 - [بهینه‌سازی و Performance](#بهینه‌سازی-و-performance)
 - [Deploy در Production](#deploy-در-production)
-- [Monitoring و Logging](#monitoring-و-logging)
 - [Troubleshooting](#troubleshooting)
 - [استفاده در Laravel](#استفاده-در-laravel)
 
@@ -461,7 +460,7 @@ recommendation/
 ├── run_recommendation.py          ✅ CLI tool
 ├── hybrid_recommender.py          ✅ سیستم ترکیبی
 ├── collaborative_filtering.py     ✅ الگوریتم CF
-├── content_based_filtering.py     ✅ الگوریتم CBF
+├── content_based_filtering.py      ✅ الگوریتم CBF
 ├── recommendation_storage.py      ✅ مدیریت Redis
 ├── object_loader.py               ✅ بارگذاری object-based
 ├── dataframe_loader.py            ✅ بارگذاری dataframe-based
@@ -472,6 +471,10 @@ recommendation/
 ├── examples_usage.py              ✅ مثال‌های استفاده
 └── README.md                      ✅ راهنمای سریع
 ```
+
+### فایل‌های حذف شده:
+- `test_connection.py` (قدیمی - جایگزین: `test_db_connection.py`)
+- `run_generate.sh` (غیرضروری)
 
 ---
 
@@ -521,56 +524,16 @@ RAM مورد نیاز:       4 GB (توصیه می‌شود)
 - Storage: 50 GB
 - **هزینه:** ~$36-48/month
 
-**گزینه 3: بزرگ (رشد سریع):**
-- RAM: 16 GB
-- CPU: 8 vCPU
-- Storage: 100 GB
-- **هزینه:** ~$72-96/month
-
 ### 📈 پیش‌بینی رشد
 
 | دوره | کاربران | حجم Redis | RAM مورد نیاز |
 |------|---------|-----------|---------------|
 | فعلی | 224K | 1.6 GB | 4 GB |
-| 6 ماه | 270K | 1.9 GB | 4 GB |
 | 1 سال | 337K | 2.4 GB | 4-8 GB |
 | 2 سال | 450K | 3.2 GB | 8 GB |
 | 3 سال | 675K | 4.8 GB | 8-12 GB |
 
-### ⚙️ تنظیمات Redis
-
-```bash
-# /etc/redis/redis.conf
-
-# Memory settings
-maxmemory 3gb
-maxmemory-policy allkeys-lru
-
-# Persistence (برای backup)
-appendonly yes
-appendfsync everysec
-
-# Performance
-tcp-keepalive 60
-timeout 0
-```
-
-### 💡 بهینه‌سازی مصرف حافظه
-
-1. **فشرده‌سازی دلیل:**
-   - از "مشابه" به جای "Collaborative: X کاربران..."
-   - صرفه‌جویی: ~10%
-
-2. **محدود کردن collaborative_details:**
-   - فقط 3 کاربر مشابه (به جای 5)
-   - صرفه‌جویی: ~15%
-
-3. **استفاده از Redis compression:**
-   ```bash
-   # در redis.conf
-   ziplist-max-entries 512
-   ziplist-max-value 64
-   ```
+> 📄 برای جزئیات بیشتر، فایل `RESOURCE_REQUIREMENTS.md` را مطالعه کنید.
 
 ---
 
@@ -764,29 +727,6 @@ else
     exit 1
 fi
 ```
-
-### Prometheus Metrics (Future)
-
-```python
-# اضافه کردن prometheus metrics
-from prometheus_client import Counter, Histogram
-
-request_count = Counter('http_requests_total', 'Total HTTP requests')
-request_duration = Histogram('http_request_duration_seconds', 'Request duration')
-```
-
-### 📖 مستندات Swagger
-
-دسترسی به مستندات تعاملی:
-
-```
-http://localhost:8000/docs
-```
-
-این صفحه شامل:
-- لیست همه endpoints
-- مثال‌های request/response
-- امکان تست مستقیم در مرورگر
 
 ---
 
@@ -1042,7 +982,7 @@ print(f"تولید شده: {metadata['generated_at']}")
 4. سیستم محصولاتی که کاربر قبلاً خریده را توصیه نمی‌کند
 5. فایل CSV را می‌توانید به راحتی در Laravel بخوانید و استفاده کنید
 6. زمان تخمینی: 100 کاربر ≈ 30 ثانیه، 1000 کاربر ≈ 3-5 دقیقه، همه کاربران ≈ 15-45 دقیقه
-7. **Postman Collection:** برای تست API، فایل `docs/Recommendation_API.postman_collection.json` را import کنید
+7. **Postman Collection:** برای تست API، فایل `Recommendation_API.postman_collection.json` را import کنید
 
 ---
 
@@ -1058,3 +998,13 @@ print(f"تولید شده: {metadata['generated_at']}")
 ---
 
 **موفق باشید! 🚀**
+
+
+
+
+
+
+
+
+
+
