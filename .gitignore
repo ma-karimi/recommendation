@@ -1,3 +1,5 @@
-./venv
+./venv/
 /.idea/
 storage
+*.log
+./__pycache__/
