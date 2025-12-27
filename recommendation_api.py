@@ -802,6 +802,117 @@ async def get_users_without_recommendations_count():
         )
 
 
+class UsersWithRecommendationsResponse(BaseModel):
+    """پاسخ لیست کاربران با توصیه"""
+    total_users: int
+    user_ids: List[int]
+    source: str  # "redis" یا "duckdb"
+
+
+@app.get("/users-with-recommendations", response_model=UsersWithRecommendationsResponse)
+async def get_users_with_recommendations(
+    limit: Optional[int] = None,
+    use_redis: bool = True,
+    use_duckdb: bool = True
+):
+    """
+    دریافت لیست ID کاربرانی که توصیه دارند
+    
+    Args:
+        limit: محدود کردن تعداد کاربران (None = همه)
+        use_redis: استفاده از Redis برای دریافت لیست (اولویت اول)
+        use_duckdb: استفاده از DuckDB برای دریافت لیست (fallback)
+    
+    Returns:
+        لیست user_id های کاربران با توصیه
+    """
+    try:
+        user_ids = []
+        source = "none"
+        
+        # 1. تلاش برای خواندن از Redis
+        if use_redis:
+            storage = app_state.init_redis_storage()
+            if storage and storage.test_connection():
+                try:
+                    # دریافت همه کلیدهای recommendation:*
+                    keys = storage.client.keys("recommendation:*")
+                    
+                    # استخراج user_id از کلیدها
+                    for key in keys:
+                        # فرمت کلید: "recommendation:{user_id}"
+                        if isinstance(key, bytes):
+                            key = key.decode('utf-8')
+                        user_id_str = key.replace("recommendation:", "")
+                        try:
+                            user_id = int(user_id_str)
+                            user_ids.append(user_id)
+                        except ValueError:
+                            logger.warning(f"Invalid user_id in key: {key}")
+                    
+                    if user_ids:
+                        source = "redis"
+                        logger.info(f"Found {len(user_ids)} users with recommendations in Redis")
+                except Exception as e:
+                    logger.warning(f"Error reading from Redis: {e}")
+        
+        # 2. Fallback: خواندن از DuckDB
+        if not user_ids and use_duckdb:
+            try:
+                from model_storage import ModelStorage
+                duckdb_storage = ModelStorage(read_only=True)
+                
+                # دریافت لیست کاربران از DuckDB
+                conn = duckdb_storage._get_connection(read_only=True)
+                try:
+                    result = conn.execute(
+                        "SELECT DISTINCT user_id FROM user_recommendations ORDER BY user_id"
+                    ).fetchall()
+                    
+                    user_ids = [row[0] for row in result]
+                    if user_ids:
+                        source = "duckdb"
+                        logger.info(f"Found {len(user_ids)} users with recommendations in DuckDB")
+                finally:
+                    # بستن connection اگر read-only است (pooled connections نباید بسته شوند)
+                    if duckdb_storage.read_only:
+                        try:
+                            conn.close()
+                        except:
+                            pass
+            except Exception as e:
+                logger.warning(f"Error reading from DuckDB: {e}")
+        
+        # محدود کردن تعداد اگر limit مشخص شده
+        if limit and limit > 0 and len(user_ids) > limit:
+            user_ids = user_ids[:limit]
+            logger.info(f"Limited to {limit} users")
+        
+        # مرتب‌سازی
+        user_ids.sort()
+        
+        if not user_ids:
+            raise HTTPException(
+                status_code=404,
+                detail="هیچ کاربری با توصیه یافت نشد"
+            )
+        
+        return UsersWithRecommendationsResponse(
+            total_users=len(user_ids),
+            user_ids=user_ids,
+            source=source
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting users with recommendations: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در دریافت لیست کاربران: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
